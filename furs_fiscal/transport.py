@@ -26,6 +26,7 @@ import base64
 import os
 import ssl
 import tempfile
+import time
 import warnings
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -39,6 +40,7 @@ from cryptography.hazmat.primitives.serialization.pkcs12 import load_pkcs12
 
 from .exceptions import (
     FURSConnectionError,
+    FURSResponseError,
     from_furs_error,
 )
 
@@ -57,6 +59,29 @@ FURS_TLS_CIPHERS = "ECDHE+AESGCM+aRSA:DHE+AESGCM+aRSA"
 
 # Recognised values for verify_furs_response.
 VerifyMode = Literal[True, False, "x5c-untrusted"]
+
+# Transport-side codes that the retry policy treats as transient. HTTP 5xx
+# is always retried; 408 (Request Timeout) and 429 (Too Many Requests) are
+# the well-known retryable 4xx codes. ``REQUEST_FAILED`` covers httpx
+# transport errors (connect / read / write / timeout). Decode failures
+# (``INVALID_RESPONSE``, ``INVALID_SIGNATURE``, ...) are deterministic and
+# therefore NOT retried.
+_RETRYABLE_CONNECTION_CODES: frozenset[str] = frozenset({
+    "REQUEST_FAILED",
+    "408",
+    "429",
+})
+
+
+def _is_retryable_connection_error(exc: FURSConnectionError) -> bool:
+    code = exc.code or ""
+    if code in _RETRYABLE_CONNECTION_CODES:
+        return True
+    # HTTP 5xx — server-side, almost always transient. Stringified status
+    # code per FURSConnectionError docstring.
+    if code.isdigit() and 500 <= int(code) < 600:
+        return True
+    return False
 
 
 class FURSTLSVerificationDisabledWarning(UserWarning):
@@ -154,6 +179,8 @@ class Connector:
         furs_response_public_key: bytes | str | None = None,
         proxy: str | None = None,
         transport: httpx.BaseTransport | None = None,
+        retries: int = 0,
+        retry_backoff: float = 0.5,
     ) -> None:
         if verify_furs_response is True and furs_response_public_key is None:
             raise ValueError(
@@ -164,12 +191,18 @@ class Connector:
             raise ValueError(
                 "verify_furs_response must be True, False, or 'x5c-untrusted'"
             )
+        if retries < 0:
+            raise ValueError("retries must be >= 0")
+        if retry_backoff < 0:
+            raise ValueError("retry_backoff must be >= 0")
 
         self._endpoint = (
             FURS_PRODUCTION_ENDPOINT if production else FURS_TEST_ENDPOINT
         )
         self._verify_furs_response = verify_furs_response
         self._furs_response_public_key = furs_response_public_key
+        self._retries = retries
+        self._retry_backoff = retry_backoff
 
         ssl_ctx, key, cert = _load_ssl_context_with_client_cert(
             p12_data=p12_data, p12_password=p12_password, verify_tls=verify_tls
@@ -222,6 +255,15 @@ class Connector:
 
         Raises :class:`FURSConnectionError` on transport / decode failure and
         :class:`FURSResponseError` on a FURS error envelope.
+
+        When the connector is constructed with ``retries > 0``, transient
+        failures are retried with exponential backoff before being surfaced
+        to the caller. Transient means: any ``httpx.RequestError`` (DNS,
+        TCP, TLS, timeout), HTTP 5xx, HTTP 408 / 429, or a FURS ``Error``
+        envelope whose subclass has ``is_retryable=True`` (currently only
+        ``FURSSystemError`` / S100). Schema / signature / certificate
+        errors are deterministic and never retried — a fresh attempt
+        would just generate the same Error envelope.
         """
         token = jwt.encode(
             payload,
@@ -229,6 +271,26 @@ class Connector:
             headers=self._jws_header(),
             algorithm="RS256",
         )
+
+        last_exc: Exception | None = None
+        for attempt in range(self._retries + 1):
+            try:
+                return self._post_once(path=path, token=token)
+            except FURSConnectionError as exc:
+                if not _is_retryable_connection_error(exc):
+                    raise
+                last_exc = exc
+            except FURSResponseError as exc:
+                if not exc.is_retryable:
+                    raise
+                last_exc = exc
+            if attempt < self._retries:
+                self._sleep_for_backoff(attempt)
+        # Loop only exits via raise above unless retries were exhausted.
+        assert last_exc is not None
+        raise last_exc
+
+    def _post_once(self, *, path: str, token: str) -> dict[str, Any]:
         try:
             response = self._client.post(path, json={"token": token})
         except httpx.RequestError as exc:
@@ -243,7 +305,7 @@ class Connector:
         try:
             body = response.json()
             response_token = body["token"]
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError, TypeError) as exc:
             raise FURSConnectionError(
                 "FURS response did not contain a valid JSON envelope with a token",
                 code="INVALID_RESPONSE",
@@ -252,6 +314,49 @@ class Connector:
         decoded = self._decode_response_token(response_token)
         self._raise_if_error_envelope(decoded)
         return decoded
+
+    def _sleep_for_backoff(self, attempt: int) -> None:
+        # Exponential: backoff * 2**attempt. Deterministic (no jitter) so
+        # tests can patch ``time.sleep`` once and assert on the cumulative
+        # delay. Callers needing jitter should override the connector or
+        # wrap submit calls themselves.
+        time.sleep(self._retry_backoff * (2 ** attempt))
+
+    def echo(self, *, path: str, message: str) -> str:
+        """POST a FURS echo message and return the echoed string.
+
+        Spec sec. 3.3 / 9.7 / 9.8: the echo endpoint takes plain JSON
+        ``{"EchoRequest": "<msg>"}`` and replies with ``{"EchoResponse":
+        "<msg>"}``. Unlike every other FURS endpoint, the body is NOT a
+        JWS — neither the request nor the reply is signed. The mTLS
+        client cert is still presented at the TLS layer, so the call is
+        also a smoke-test of the loaded p12.
+        """
+        try:
+            response = self._client.post(path, json={"EchoRequest": message})
+        except httpx.RequestError as exc:
+            raise FURSConnectionError(str(exc), code="REQUEST_FAILED") from exc
+
+        if response.status_code != 200:
+            raise FURSConnectionError(
+                f"HTTP {response.status_code}: {response.text[:500]}",
+                code=str(response.status_code),
+            )
+
+        try:
+            body = response.json()
+            echoed = body["EchoResponse"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise FURSConnectionError(
+                "FURS echo reply did not contain an EchoResponse field",
+                code="INVALID_RESPONSE",
+            ) from exc
+        if not isinstance(echoed, str):
+            raise FURSConnectionError(
+                f"FURS echo reply EchoResponse was not a string: {echoed!r}",
+                code="INVALID_RESPONSE",
+            )
+        return echoed
 
     # -- Response signature verification --------------------------------------
 

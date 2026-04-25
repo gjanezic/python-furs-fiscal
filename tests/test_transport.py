@@ -552,3 +552,353 @@ def test_pinned_key_mode_rejects_response_signed_by_other_key(p12_data_and_key):
             conn.post(path="v1/cash_registers/invoices", payload={})
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Echo (spec sec. 3.3 / 9.7 / 9.8) — plain JSON, not JWS
+# ---------------------------------------------------------------------------
+
+
+def test_echo_round_trip_does_not_sign_request(p12_data_and_key):
+    """Echo must POST plain ``{"EchoRequest": ...}`` (no JWS) and parse
+    plain ``{"EchoResponse": ...}`` back."""
+    p12_data, _ = p12_data_and_key
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = request.read()
+        return httpx.Response(200, json={"EchoResponse": "furs"})
+
+    conn = _connector_with_mock_transport(p12_data, handler)
+    try:
+        result = conn.echo(path="v1/cash_registers/echo", message="furs")
+    finally:
+        conn.close()
+
+    assert result == "furs"
+    assert seen["path"].endswith("/v1/cash_registers/echo")
+    body = seen["body"].decode("utf-8")
+    assert '"EchoRequest"' in body
+    # The JWS path produces ``{"token":"<dot>.<dot>.<dot>"}``; the echo
+    # path must not.
+    assert '"token"' not in body
+
+
+def test_echo_raises_on_non_200(p12_data_and_key):
+    p12_data, _ = p12_data_and_key
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="busy")
+
+    conn = _connector_with_mock_transport(p12_data, handler)
+    try:
+        with pytest.raises(FURSConnectionError, match="503"):
+            conn.echo(path="v1/cash_registers/echo", message="furs")
+    finally:
+        conn.close()
+
+
+def test_echo_raises_on_missing_field(p12_data_and_key):
+    p12_data, _ = p12_data_and_key
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"unexpected": "shape"})
+
+    conn = _connector_with_mock_transport(p12_data, handler)
+    try:
+        with pytest.raises(FURSConnectionError, match="EchoResponse"):
+            conn.echo(path="v1/cash_registers/echo", message="furs")
+    finally:
+        conn.close()
+
+
+def test_echo_raises_on_non_string_field(p12_data_and_key):
+    p12_data, _ = p12_data_and_key
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"EchoResponse": 123})
+
+    conn = _connector_with_mock_transport(p12_data, handler)
+    try:
+        with pytest.raises(FURSConnectionError, match="not a string"):
+            conn.echo(path="v1/cash_registers/echo", message="furs")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Retry policy — only retries on transient failures (S100, 5xx, 408, 429,
+# httpx.RequestError). Schema / signature / cert errors are deterministic
+# and never retried.
+# ---------------------------------------------------------------------------
+
+
+def _connector_with_retry(
+    p12_data: bytes, handler, *, retries: int
+) -> Connector:
+    return Connector(
+        p12_data=p12_data,
+        p12_password=P12_PASSWORD,
+        production=False,
+        retries=retries,
+        retry_backoff=0.0,  # no real sleep in tests
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def _ok_response_token() -> str:
+    response_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    response_cert = _build_response_signing_cert(response_key)
+    return _make_response_token(
+        {"InvoiceResponse": {"UniqueInvoiceID": "EOR-OK"}},
+        response_key,
+        response_cert,
+    )
+
+
+def _s100_response_token() -> str:
+    response_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    response_cert = _build_response_signing_cert(response_key)
+    return _make_response_token(
+        {
+            "InvoiceResponse": {
+                "Header": {"MessageID": "x", "DateTime": "2026-04-25T10:00:00"},
+                "Error": {"ErrorCode": "S100", "ErrorMessage": "transient"},
+            }
+        },
+        response_key,
+        response_cert,
+    )
+
+
+def _s001_response_token() -> str:
+    response_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    response_cert = _build_response_signing_cert(response_key)
+    return _make_response_token(
+        {
+            "InvoiceResponse": {
+                "Header": {"MessageID": "x", "DateTime": "2026-04-25T10:00:00"},
+                "Error": {"ErrorCode": "S001", "ErrorMessage": "schema"},
+            }
+        },
+        response_key,
+        response_cert,
+    )
+
+
+def test_retry_recovers_after_s100(p12_data_and_key):
+    """S100 is the canonical retryable FURS error (sec. 4)."""
+    p12_data, _ = p12_data_and_key
+    calls = {"n": 0}
+    bad = _s100_response_token()
+    good = _ok_response_token()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        token = bad if calls["n"] == 1 else good
+        return httpx.Response(200, json={"token": token})
+
+    conn = _connector_with_retry(p12_data, handler, retries=2)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FURSResponseChainNotVerifiedWarning)
+            decoded = conn.post(
+                path="v1/cash_registers/invoices", payload={"x": 1}
+            )
+    finally:
+        conn.close()
+    assert calls["n"] == 2
+    assert decoded["InvoiceResponse"]["UniqueInvoiceID"] == "EOR-OK"
+
+
+def test_retry_does_not_retry_s001(p12_data_and_key):
+    """Schema errors are deterministic: a retry would just repeat the failure."""
+    p12_data, _ = p12_data_and_key
+    calls = {"n": 0}
+    bad = _s001_response_token()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"token": bad})
+
+    conn = _connector_with_retry(p12_data, handler, retries=5)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FURSResponseChainNotVerifiedWarning)
+            with pytest.raises(FURSSchemaError):
+                conn.post(path="v1/cash_registers/invoices", payload={"x": 1})
+    finally:
+        conn.close()
+    assert calls["n"] == 1
+
+
+def test_retry_recovers_after_5xx(p12_data_and_key):
+    p12_data, _ = p12_data_and_key
+    calls = {"n": 0}
+    good = _ok_response_token()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, text="busy")
+        return httpx.Response(200, json={"token": good})
+
+    conn = _connector_with_retry(p12_data, handler, retries=2)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FURSResponseChainNotVerifiedWarning)
+            decoded = conn.post(
+                path="v1/cash_registers/invoices", payload={"x": 1}
+            )
+    finally:
+        conn.close()
+    assert calls["n"] == 2
+    assert decoded["InvoiceResponse"]["UniqueInvoiceID"] == "EOR-OK"
+
+
+def test_retry_does_not_retry_4xx(p12_data_and_key):
+    """Generic 4xx is not retried — the request is malformed and re-sending
+    won't help. (408 / 429 are retried elsewhere.)"""
+    p12_data, _ = p12_data_and_key
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(400, text="bad request")
+
+    conn = _connector_with_retry(p12_data, handler, retries=5)
+    try:
+        with pytest.raises(FURSConnectionError, match="400"):
+            conn.post(path="v1/cash_registers/invoices", payload={"x": 1})
+    finally:
+        conn.close()
+    assert calls["n"] == 1
+
+
+def test_retry_recovers_after_request_error(p12_data_and_key):
+    p12_data, _ = p12_data_and_key
+    calls = {"n": 0}
+    good = _ok_response_token()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, json={"token": good})
+
+    conn = _connector_with_retry(p12_data, handler, retries=2)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FURSResponseChainNotVerifiedWarning)
+            decoded = conn.post(
+                path="v1/cash_registers/invoices", payload={"x": 1}
+            )
+    finally:
+        conn.close()
+    assert calls["n"] == 2
+    assert decoded["InvoiceResponse"]["UniqueInvoiceID"] == "EOR-OK"
+
+
+def test_retry_429_and_408_are_retryable(p12_data_and_key):
+    p12_data, _ = p12_data_and_key
+    good = _ok_response_token()
+    for transient_status in (408, 429):
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request, status=transient_status) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(status, text="slow down")
+            return httpx.Response(200, json={"token": good})
+
+        conn = _connector_with_retry(p12_data, handler, retries=1)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FURSResponseChainNotVerifiedWarning)
+                conn.post(path="v1/cash_registers/invoices", payload={"x": 1})
+        finally:
+            conn.close()
+        assert calls["n"] == 2, f"status {transient_status} should retry"
+
+
+def test_retry_exhaustion_raises_last_error(p12_data_and_key):
+    """After all retries are spent, the most recent transient error surfaces."""
+    p12_data, _ = p12_data_and_key
+    calls = {"n": 0}
+    bad = _s100_response_token()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"token": bad})
+
+    conn = _connector_with_retry(p12_data, handler, retries=2)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FURSResponseChainNotVerifiedWarning)
+            with pytest.raises(FURSSystemError):
+                conn.post(path="v1/cash_registers/invoices", payload={"x": 1})
+    finally:
+        conn.close()
+    # 1 initial attempt + 2 retries = 3 total
+    assert calls["n"] == 3
+
+
+def test_retries_default_is_zero(p12_data_and_key):
+    """Library default keeps the legacy single-attempt behaviour."""
+    p12_data, _ = p12_data_and_key
+    conn = Connector(
+        p12_data=p12_data, p12_password=P12_PASSWORD, production=False
+    )
+    try:
+        assert conn._retries == 0
+    finally:
+        conn.close()
+
+
+def test_connector_rejects_negative_retries(p12_data_and_key):
+    p12_data, _ = p12_data_and_key
+    with pytest.raises(ValueError, match="retries must be >= 0"):
+        Connector(
+            p12_data=p12_data,
+            p12_password=P12_PASSWORD,
+            production=False,
+            retries=-1,
+        )
+
+
+def test_connector_rejects_negative_backoff(p12_data_and_key):
+    p12_data, _ = p12_data_and_key
+    with pytest.raises(ValueError, match="retry_backoff must be >= 0"):
+        Connector(
+            p12_data=p12_data,
+            p12_password=P12_PASSWORD,
+            production=False,
+            retry_backoff=-0.1,
+        )
+
+
+def test_echo_does_not_retry(p12_data_and_key):
+    """Echo is a connectivity probe — auto-retry would mask the failure
+    that the caller is trying to detect."""
+    p12_data, _ = p12_data_and_key
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, text="busy")
+
+    conn = Connector(
+        p12_data=p12_data,
+        p12_password=P12_PASSWORD,
+        production=False,
+        retries=5,  # would retry post() — but echo() bypasses the loop
+        retry_backoff=0.0,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(FURSConnectionError, match="503"):
+            conn.echo(path="v1/cash_registers/echo", message="furs")
+    finally:
+        conn.close()
+    assert calls["n"] == 1

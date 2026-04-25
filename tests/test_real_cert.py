@@ -619,6 +619,37 @@ def test_pinned_response_key_rejects_responses_signed_by_other_keys(
     not os.environ.get("FURS_LIVE_TEST"),
     reason="set FURS_LIVE_TEST=1 to hit blagajne-test.fu.gov.si:9002",
 )
+def test_live_echo_against_furs_test_endpoint(real_p12_data):
+    """Round-trip a plain ``EchoRequest`` through the FURS test endpoint.
+
+    Unlike every other FURS endpoint the echo body is not a JWS, so
+    response signature verification never runs — it's a pure
+    TLS/connectivity smoke test. We still load the client p12 so the
+    mTLS handshake exercises the same code path used by the signed
+    endpoints. Useful as a fast canary that surfaces TLS / cipher / DNS
+    breakage independently of FURS schema or signing logic.
+    """
+    if not TEST_TLS_BUNDLE.exists():
+        pytest.skip(
+            "specs/test_certs/sigov-ca-bundle.pem is required for the "
+            "TLS-pinned live echo test"
+        )
+
+    with FURSClient(
+        p12_data=real_p12_data,
+        p12_password=REAL_P12_PASSWORD,
+        production=False,
+        request_timeout=30.0,
+        verify_tls=str(TEST_TLS_BUNDLE),
+        verify_furs_response="x5c-untrusted",  # echo isn't signed; mode is unused
+    ) as client:
+        assert client.echo("furs") == "furs"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("FURS_LIVE_TEST"),
+    reason="set FURS_LIVE_TEST=1 to hit blagajne-test.fu.gov.si:9002",
+)
 def test_live_register_business_premise_against_furs_test_endpoint(real_p12_data):
     """Round-trip a business-premise registration through the *real* FURS
     test endpoint, in fully-secure mode:

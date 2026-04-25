@@ -65,6 +65,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
 from .exceptions import (
     FURSBatchError,
+    FURSConnectionError,
     FURSResponseError,
     from_furs_error,
 )
@@ -91,6 +92,7 @@ PATH_INVOICE = "v1/cash_registers/invoices"
 PATH_INVOICE_BATCH = "v1/cash_registers_batch/invoices"
 PATH_BUSINESS_PREMISE = "v1/cash_registers/invoices/register"
 PATH_BUSINESS_PREMISE_BATCH = "v1/cash_registers_batch/invoices/register"
+PATH_ECHO = "v1/cash_registers/echo"
 
 
 class FURSClient:
@@ -108,6 +110,8 @@ class FURSClient:
         furs_response_public_key: bytes | str | None = None,
         proxy: str | None = None,
         transport: httpx.BaseTransport | None = None,
+        retries: int = 0,
+        retry_backoff: float = 0.5,
     ) -> None:
         self._connector = Connector(
             p12_data=p12_data,
@@ -119,6 +123,8 @@ class FURSClient:
             furs_response_public_key=furs_response_public_key,
             proxy=proxy,
             transport=transport,
+            retries=retries,
+            retry_backoff=retry_backoff,
         )
 
     # -- Trust material -------------------------------------------------------
@@ -181,6 +187,19 @@ class FURSClient:
             tax_number=tax_number, zoi=zoi, issued_date=issued_date
         )
 
+    # -- Echo (ISFU availability check) --------------------------------------
+
+    def echo(self, message: str = "furs") -> str:
+        """Send an echo message to ISFU and return the server's reply.
+
+        Spec sec. 3.3 / 6.1: a connectivity probe against
+        ``/v1/cash_registers/echo``. Unlike every other FURS endpoint the
+        body is plain JSON, not a JWS. The mTLS client cert is still
+        presented at the TLS layer, so a successful echo also confirms
+        the loaded p12 can negotiate against FURS.
+        """
+        return self._connector.echo(path=PATH_ECHO, message=message)
+
     # -- Single-record submissions -------------------------------------------
 
     def submit_invoice(self, invoice: Invoice) -> str:
@@ -189,6 +208,26 @@ class FURSClient:
             path=PATH_INVOICE, payload=wrap_invoice(invoice)
         )
         return decoded["InvoiceResponse"]["UniqueInvoiceID"]
+
+    def submit_invoice_subsequent(self, invoice: Invoice) -> str:
+        """POST an invoice that was issued offline (R_3.13 ``SubsequentSubmit=true``).
+
+        Convenience for the offline-then-catch-up flow described in spec
+        sec. 3.1 / R_3.13: the invoice was printed without an EOR (e.g.
+        the cash register lost connectivity), and is now being submitted
+        retroactively. Sets ``subsequent_submit=True`` on the payload if
+        the caller has not already.
+
+        ``invoice.protected_id`` (ZOI) MUST match the value already
+        printed on the customer receipt — otherwise the printed QR /
+        Code-128 / PDF-417 payload won't verify against the FURS-side
+        record. Re-run :meth:`calculate_zoi` with the original
+        ``issued_date`` and ``invoice_amount`` if you need to reconstruct
+        it from receipt data.
+        """
+        if not invoice.subsequent_submit:
+            invoice = invoice.model_copy(update={"subsequent_submit": True})
+        return self.submit_invoice(invoice)
 
     def submit_sales_book_invoice(self, invoice: SalesBookInvoice) -> str:
         """POST a pre-numbered-invoice-book invoice and return the EOR."""
@@ -202,6 +241,23 @@ class FURSClient:
         return self._connector.post(
             path=PATH_BUSINESS_PREMISE, payload=wrap_business_premise(premise)
         )
+
+    def close_business_premise(self, premise: BusinessPremise) -> dict[str, Any]:
+        """Permanently close a business premise (P_7.0 ``ClosingTag='Z'``).
+
+        Convenience over :meth:`submit_business_premise`: sets
+        ``ClosingTag='Z'`` on the payload if the caller has not already.
+        After FURS accepts the closure, the spec forbids issuing further
+        invoices against this BusinessPremiseID — re-using the ID will
+        produce ``FURSBusinessPremiseError`` (S006).
+
+        The full ``BusinessPremise`` record (TaxNumber, BPIdentifier,
+        ValidityDate, SoftwareSupplier) must still be supplied; FURS
+        does not accept a closure-only payload.
+        """
+        if premise.closing_tag != "Z":
+            premise = premise.model_copy(update={"closing_tag": "Z"})
+        return self.submit_business_premise(premise)
 
     # -- Batch submissions ----------------------------------------------------
 
@@ -226,11 +282,30 @@ class FURSClient:
     def submit_business_premise_batch(
         self, premises: list[BusinessPremise]
     ) -> dict[str, Any]:
-        """POST a 2..500-record business-premise batch."""
-        return self._connector.post(
+        """POST a 2..500-record business-premise batch and return the Header.
+
+        Returns the response ``Header`` (``{MessageID, DateTime}``).
+        Unlike invoice batches, premise batches have no per-record reply
+        in the schema (``BusinessPremiseListResponse`` carries only a
+        Header, plus an Error envelope on failure) — a batch either
+        succeeds wholesale or raises :class:`FURSResponseError`.
+
+        Raises :class:`FURSConnectionError` if the response shape is
+        unexpected (missing the ``BusinessPremiseListResponse`` envelope
+        or its ``Header``).
+        """
+        decoded = self._connector.post(
             path=PATH_BUSINESS_PREMISE_BATCH,
             payload=wrap_business_premise_batch(premises),
         )
+        try:
+            return decoded["BusinessPremiseListResponse"]["Header"]
+        except (KeyError, TypeError) as exc:
+            raise FURSConnectionError(
+                "FURS business-premise batch reply is missing the expected "
+                "BusinessPremiseListResponse / Header envelope",
+                code="INVALID_RESPONSE",
+            ) from exc
 
     @staticmethod
     def _collect_record_replies(

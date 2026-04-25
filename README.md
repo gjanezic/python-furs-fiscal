@@ -12,6 +12,7 @@ Typed, modern Python client for the **Slovenian FURS** (Finančna uprava Republi
 * **Minimised on-disk key exposure** — PEMs are written to `mkstemp` (mode `0600`) only for the duration of `ssl.SSLContext.load_cert_chain`, then immediately unlinked. After that brief window the key material lives only in the SSLContext for the connector's lifetime. (Fully memory-only mTLS is not possible with stdlib `ssl`, which requires file paths.)
 * **Secure-by-default** — `verify_tls=True` and `verify_furs_response='x5c-untrusted'` are the defaults. The strongest mode (`verify_furs_response=True` with a pinned public key) is one parameter away.
 * **Granular exception hierarchy** — `FURSSchemaError` (S001/S002), `FURSSignatureError` (S003), `FURSCertificateError` (S004/S005/S007/S008 — unknown / tax-number mismatch / revoked / expired), `FURSBusinessPremiseError` (S006), `FURSSystemError` (S100, carries `is_retryable=True`), `FURSServerError` (catch-all for unmodelled codes), `FURSBatchError` (with per-record `record_errors` and `successes`), `FURSConnectionError`, `FURSValidationError`. Catch what you can act on.
+* **Built-in retry on transient failures** — pass `retries=N` (and optional `retry_backoff=0.5`) to `FURSClient` to auto-retry only the failures that justify it: `httpx.RequestError`, HTTP 5xx / 408 / 429, and `FURSSystemError` (S100). Schema, signature, certificate, and 4xx errors are never retried — they're deterministic. Default is `retries=0`.
 * **Replay-tested against the official FURS samples** — `tests/test_replay.py` decodes every signed example in `specs/examples/`, builds the same payload via the library, and asserts byte equivalence (modulo the per-message Header) plus JSON Schema validation.
 
 ## Installation
@@ -196,6 +197,55 @@ except FURSBatchError as exc:
 
 A batch must contain 2..500 records. The transport layer raises a `FURSBatchError` whenever any record reply contains an `Error` block; successful records remain accessible on the exception so callers can persist the EORs without resubmitting.
 
+`submit_business_premise_batch(premises)` returns the response `Header` (`{MessageID, DateTime}`) — premise batches have no per-record reply in the schema, they either succeed wholesale or raise `FURSResponseError`.
+
+## Subsequent Submit (Offline-Then-Catch-Up)
+
+When a register prints a receipt without a live FURS connection, the EOR can't appear on the printed receipt — but the ZOI (calculated locally) can, and is what FURS later cross-verifies. Submit the same payload retroactively with `SubsequentSubmit=true`:
+
+```python
+# Same Invoice you built when the receipt was printed — same ZOI in
+# protected_id, same issue_date_time, same invoice_number. The helper
+# only flips SubsequentSubmit; do not change anything else.
+eor = client.submit_invoice_subsequent(invoice)
+```
+
+The flag corresponds to spec R_3.13. The helper does not mutate the input — it `model_copy`s with `subsequent_submit=True` and submits.
+
+## Closing a Business Premise
+
+`ClosingTag='Z'` (P_7.0) permanently retires a `BusinessPremiseID`. After FURS accepts the closure, further invoices against that ID will return `FURSBusinessPremiseError` (S006).
+
+```python
+# Build the same BusinessPremise you registered originally — FURS
+# requires the full record, not just the ID.
+client.close_business_premise(bp)
+```
+
+## Echo (Connectivity Check)
+
+A plain JSON ping that exercises mTLS but not JWS. Useful as a fast health check.
+
+```python
+assert client.echo("furs") == "furs"
+```
+
+`echo()` deliberately bypasses the retry loop — its purpose IS to surface a failed connection, not paper over one.
+
+## Retries on Transient Failures
+
+```python
+client = FURSClient(
+    p12_data=...,
+    p12_password=...,
+    production=False,
+    retries=3,            # 1 initial + up to 3 retries
+    retry_backoff=0.5,    # exponential: 0.5s, 1.0s, 2.0s
+)
+```
+
+Retried: `httpx.RequestError` (DNS/TCP/TLS/timeout), HTTP 5xx, HTTP 408, HTTP 429, and `FURSSystemError` (S100). Not retried: schema (S001/S002), signature (S003), certificate (S004/S005/S007/S008), business-premise (S006), `FURSBatchError`, and generic 4xx — those are deterministic and a fresh attempt would just repeat the same failure.
+
 ## Security: TLS and FURS Response Verification
 
 ### `verify_tls`
@@ -274,14 +324,15 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The suite (132 tests) covers:
+The suite (156 tests; 154 offline + 2 live, the live ones gated behind `FURS_LIVE_TEST=1`) covers:
 
 * **Models** — pydantic validation, IEEE-754 round-trip safety, datetime conversion, mutual-exclusion rules, batch envelope construction. Property-based tests via `hypothesis`.
 * **ZOI** — determinism, validation, Europe/Ljubljana wall-time semantics.
-* **Transport** — in-memory mTLS, TLS 1.2 floor + AEAD-RSA cipher pinning (spec sec. 2 / 6.2), x5c response verification (good cert / expired cert / wrong key / missing header), pinned-key mode, error-code → exception routing for S001..S008/S100 (case-insensitive).
-* **API** — full submit flows over `httpx.MockTransport`, batch handling with per-record errors.
+* **Transport** — in-memory mTLS, TLS 1.2 floor + AEAD-RSA cipher pinning (spec sec. 2 / 6.2), x5c response verification (good cert / expired cert / wrong key / missing header), pinned-key mode, error-code → exception routing for S001..S008/S100 (case-insensitive), echo round-trip, retry policy (S100 + 5xx + 408/429 + `httpx.RequestError`; deterministic errors and 4xx are NOT retried).
+* **API** — full submit flows over `httpx.MockTransport`, batch handling with per-record errors, `submit_invoice_subsequent` / `close_business_premise` helpers, business-premise batch envelope validation.
 * **Replay** — every official signed example in `specs/examples/` is decoded, rebuilt by the library, and compared structurally + validated against `specs/schemas/FiscalVerificationSchema*.json`.
 * **Real-cert surveillance** — yellow-warns ahead of FURS-published cert rotations and ahead of the documented production-cipher-list rotation (2026-05-12); fails red after the date so CI nags the maintainer to refresh.
+* **Live FURS test endpoint** (opt-in: `FURS_LIVE_TEST=1`) — round-trips an `EchoRequest` and a business-premise registration through `blagajne-test.fu.gov.si:9002` in the strongest mode the library supports.
 
 ## Migrating from 1.x
 
