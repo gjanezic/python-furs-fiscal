@@ -5,6 +5,7 @@ from __future__ import annotations
 from .api import FURSClient
 from .exceptions import (
     FURSBatchError,
+    FURSBusinessPremiseError,
     FURSCertificateError,
     FURSConnectionError,
     FURSError,
@@ -12,6 +13,7 @@ from .exceptions import (
     FURSSchemaError,
     FURSServerError,
     FURSSignatureError,
+    FURSSystemError,
     FURSValidationError,
 )
 from .models import (
@@ -97,6 +99,8 @@ __all__ = [
     "FURSSchemaError",
     "FURSSignatureError",
     "FURSCertificateError",
+    "FURSBusinessPremiseError",
+    "FURSSystemError",
     "FURSServerError",
     "FURSBatchError",
 ]

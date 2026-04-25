@@ -45,6 +45,16 @@ from .exceptions import (
 FURS_TEST_ENDPOINT = "https://blagajne-test.fu.gov.si:9002"
 FURS_PRODUCTION_ENDPOINT = "https://blagajne.fu.gov.si:9003"
 
+# Spec sec. 6.2 (v3.2) restricts TLS to AEAD ECDHE/DHE-RSA suites. This OpenSSL
+# cipher string selects the intersection of the test (6.2.1, active 2.4.2026)
+# and production (6.2.2, active until 12.5.2026) lists, all of which the FURS
+# server's RSA cert can negotiate. The ``+aRSA`` qualifier requires RSA
+# authentication, dropping unreachable ECDSA / DSS-keyed AEAD suites that
+# OpenSSL would otherwise advertise (FURS issues an RSA cert; ECDSA / DSS
+# variants cannot negotiate against it). TLS 1.3 cipher suites are configured
+# separately by OpenSSL and are not affected by set_ciphers().
+FURS_TLS_CIPHERS = "ECDHE+AESGCM+aRSA:DHE+AESGCM+aRSA"
+
 # Recognised values for verify_furs_response.
 VerifyMode = Literal[True, False, "x5c-untrusted"]
 
@@ -90,6 +100,14 @@ def _load_ssl_context_with_client_cert(
         ctx = ssl.create_default_context(cafile=verify_tls)
     else:
         ctx = ssl.create_default_context()
+
+    # Spec sec. 2 disables TLS 1.0 (since 30.6.2018) and TLS 1.1 (since
+    # 23.4.2019) and explicitly allows only TLS 1.2 and 1.3. Pin the floor so
+    # an unusual OpenSSL build can't downgrade. Spec sec. 6.2 (v3.2) lists the
+    # accepted cipher suites; we restrict TLS 1.2 to the AEAD subset present
+    # in both the test (6.2.1) and production (6.2.2) lists.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.set_ciphers(FURS_TLS_CIPHERS)
 
     cert_pem = cert.public_bytes(serialization.Encoding.PEM)
     key_pem = key.private_bytes(

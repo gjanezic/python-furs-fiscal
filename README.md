@@ -11,7 +11,7 @@ Typed, modern Python client for the **Slovenian FURS** (Finančna uprava Republi
 * **Timezone-aware datetimes everywhere** — naive datetimes are rejected. All datetimes are auto-converted to `Europe/Ljubljana` before formatting per FURS spec.
 * **Minimised on-disk key exposure** — PEMs are written to `mkstemp` (mode `0600`) only for the duration of `ssl.SSLContext.load_cert_chain`, then immediately unlinked. After that brief window the key material lives only in the SSLContext for the connector's lifetime. (Fully memory-only mTLS is not possible with stdlib `ssl`, which requires file paths.)
 * **Secure-by-default** — `verify_tls=True` and `verify_furs_response='x5c-untrusted'` are the defaults. The strongest mode (`verify_furs_response=True` with a pinned public key) is one parameter away.
-* **Granular exception hierarchy** — `FURSSchemaError`, `FURSSignatureError`, `FURSCertificateError`, `FURSServerError`, `FURSBatchError` (with per-record `record_errors` and `successes`), `FURSConnectionError`, `FURSValidationError`. Catch what you can act on.
+* **Granular exception hierarchy** — `FURSSchemaError` (S001/S002), `FURSSignatureError` (S003), `FURSCertificateError` (S004/S005/S007/S008 — unknown / tax-number mismatch / revoked / expired), `FURSBusinessPremiseError` (S006), `FURSSystemError` (S100, carries `is_retryable=True`), `FURSServerError` (catch-all for unmodelled codes), `FURSBatchError` (with per-record `record_errors` and `successes`), `FURSConnectionError`, `FURSValidationError`. Catch what you can act on.
 * **Replay-tested against the official FURS samples** — `tests/test_replay.py` decodes every signed example in `specs/examples/`, builds the same payload via the library, and asserts byte equivalence (modulo the per-message Header) plus JSON Schema validation.
 
 ## Installation
@@ -220,17 +220,34 @@ For real MITM protection in production, combine `verify_tls=<sigov-ca-path>` wit
 
 ```
 FURSError
-├── FURSValidationError       — local validation failed (also a ValueError)
-├── FURSConnectionError       — transport / decode failure
-├── FURSResponseError         — FURS returned an Error envelope
-│   ├── FURSSchemaError       — S001 / S002
-│   ├── FURSSignatureError    — S003
-│   ├── FURSCertificateError  — S004
-│   └── FURSServerError       — every other code
-└── FURSBatchError            — one or more records in a batch failed
-                                (record_errors: dict[int, FURSResponseError],
-                                 successes:     dict[int, {ProtectedID, UniqueInvoiceID}])
+├── FURSValidationError            — local validation failed (also a ValueError)
+├── FURSConnectionError            — transport / decode failure
+├── FURSResponseError              — FURS returned an Error envelope
+│   ├── FURSSchemaError            — S001 / S002
+│   ├── FURSSignatureError         — S003
+│   ├── FURSCertificateError       — S004 / S005 / S007 / S008
+│   │                                (unknown / tax-number mismatch /
+│   │                                 revoked / expired digital cert)
+│   ├── FURSBusinessPremiseError   — S006 (premise not registered)
+│   ├── FURSSystemError            — S100 (transient, is_retryable=True)
+│   └── FURSServerError            — every other code
+└── FURSBatchError                 — one or more records in a batch failed
+                                     (record_errors: dict[int, FURSResponseError],
+                                      successes:     dict[int, {ProtectedID, UniqueInvoiceID}])
 ```
+
+`FURSResponseError.is_retryable` is `False` by default and `True` on
+`FURSSystemError`. Retry middleware can branch on that attribute without
+having to maintain its own list of error codes.
+
+> **Behaviour change in 2.1**: in 2.0, only S004 raised
+> `FURSCertificateError` and S005/S007/S008 fell through to
+> `FURSServerError`. They now all raise `FURSCertificateError`, and S006
+> raises the new `FURSBusinessPremiseError` (also previously
+> `FURSServerError`), and S100 raises the new `FURSSystemError`. Code
+> that catches `FURSServerError` to handle these specifically must move
+> to the new classes; code that catches the broader `FURSResponseError`
+> is unaffected.
 
 ## ZOI and Printable QR/Code-128 Data
 
@@ -257,13 +274,14 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The suite (88 tests) covers:
+The suite (132 tests) covers:
 
 * **Models** — pydantic validation, IEEE-754 round-trip safety, datetime conversion, mutual-exclusion rules, batch envelope construction. Property-based tests via `hypothesis`.
 * **ZOI** — determinism, validation, Europe/Ljubljana wall-time semantics.
-* **Transport** — in-memory mTLS, x5c response verification (good cert / expired cert / wrong key / missing header), pinned-key mode, error envelope routing.
+* **Transport** — in-memory mTLS, TLS 1.2 floor + AEAD-RSA cipher pinning (spec sec. 2 / 6.2), x5c response verification (good cert / expired cert / wrong key / missing header), pinned-key mode, error-code → exception routing for S001..S008/S100 (case-insensitive).
 * **API** — full submit flows over `httpx.MockTransport`, batch handling with per-record errors.
 * **Replay** — every official signed example in `specs/examples/` is decoded, rebuilt by the library, and compared structurally + validated against `specs/schemas/FiscalVerificationSchema*.json`.
+* **Real-cert surveillance** — yellow-warns ahead of FURS-published cert rotations and ahead of the documented production-cipher-list rotation (2026-05-12); fails red after the date so CI nags the maintainer to refresh.
 
 ## Migrating from 1.x
 

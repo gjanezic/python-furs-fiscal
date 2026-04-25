@@ -1,18 +1,23 @@
 """FURS exception hierarchy.
 
 The hierarchy lets callers catch broad failure classes (network, validation,
-server error) or specific FURS error codes (S001..S004 etc. per spec sec. 4)
+server error) or specific FURS error codes (S001..S008, S100 per spec sec. 4)
 without parsing strings.
 
     FURSError
-    ├── FURSValidationError       — local validation failed before sending
-    ├── FURSConnectionError       — transport / decode failure
-    ├── FURSResponseError         — FURS returned an Error envelope
-    │   ├── FURSSchemaError       — S001 / S002 schema mismatch
-    │   ├── FURSSignatureError    — S003 invalid digital signature
-    │   ├── FURSCertificateError  — S004 unknown certificate
-    │   └── FURSServerError       — anything else FURS sends
-    └── FURSBatchError            — one or more records in a batch failed
+    ├── FURSValidationError            — local validation failed before sending
+    ├── FURSConnectionError            — transport / decode failure
+    ├── FURSResponseError              — FURS returned an Error envelope
+    │   ├── FURSSchemaError            — S001 / S002 schema mismatch
+    │   ├── FURSSignatureError         — S003 invalid digital signature
+    │   ├── FURSCertificateError       — S004 unknown / S005 tax-number
+    │   │                                 mismatch / S007 revoked /
+    │   │                                 S008 expired digital certificate
+    │   ├── FURSBusinessPremiseError   — S006 business premise not registered
+    │   ├── FURSSystemError            — S100 server-side processing error
+    │   │                                 (typically transient, retryable)
+    │   └── FURSServerError            — anything else FURS sends
+    └── FURSBatchError                 — one or more records in a batch failed
 """
 
 from __future__ import annotations
@@ -59,7 +64,17 @@ class FURSResponseError(FURSError):
     """FURS returned a structured ``Error`` element in the response envelope.
 
     See spec sec. 4 for the official error code table.
+
+    The ``is_retryable`` class attribute lets consumers branch on
+    retryability without an ``isinstance`` ladder. It defaults to
+    ``False`` because most FURS error codes (schema mismatch, bad
+    signature, unknown cert, …) are deterministic — retrying without
+    fixing the underlying cause is wasted traffic. Subclasses that
+    represent transient server-side conditions override this to ``True``
+    (see :class:`FURSSystemError`).
     """
+
+    is_retryable: bool = False
 
     def __init__(self, code: str, message: str) -> None:
         self.code = code
@@ -76,7 +91,34 @@ class FURSSignatureError(FURSResponseError):
 
 
 class FURSCertificateError(FURSResponseError):
-    """S004 — submitter's signing certificate is not registered with FURS."""
+    """Certificate-binding failures.
+
+    Covers S004 (unknown certificate), S005 (tax number in the message does
+    not match the tax number on the digital certificate), S007 (digital
+    certificate revoked), and S008 (digital certificate expired).
+    """
+
+
+class FURSBusinessPremiseError(FURSResponseError):
+    """S006 — data about the business premise have not been submitted.
+
+    The premise referenced by the invoice is not registered with FURS, or
+    has been marked closed (ClosingTag=Z). The caller usually wants to
+    register / re-register the premise and retry the invoice.
+    """
+
+
+class FURSSystemError(FURSResponseError):
+    """S100 — system error at processing of the message (typically transient).
+
+    Distinct from :class:`FURSServerError` because S100 is documented as a
+    server-side processing failure that callers may safely retry, whereas
+    other unmapped codes may indicate persistent issues. Carries
+    ``is_retryable = True`` so retry middleware can branch without
+    pattern-matching on the code.
+    """
+
+    is_retryable: bool = True
 
 
 class FURSServerError(FURSResponseError):
@@ -88,6 +130,11 @@ _ERROR_CODE_MAP: dict[str, type[FURSResponseError]] = {
     "S002": FURSSchemaError,
     "S003": FURSSignatureError,
     "S004": FURSCertificateError,
+    "S005": FURSCertificateError,
+    "S006": FURSBusinessPremiseError,
+    "S007": FURSCertificateError,
+    "S008": FURSCertificateError,
+    "S100": FURSSystemError,
 }
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import os
+import ssl
 import warnings
 from datetime import datetime, timedelta, timezone
 
@@ -22,15 +23,20 @@ from cryptography.x509.oid import NameOID
 from furs_fiscal import (
     FURS_PRODUCTION_ENDPOINT,
     FURS_TEST_ENDPOINT,
+    FURSBusinessPremiseError,
     FURSCertificateError,
     FURSConnectionError,
     FURSResponseChainNotVerifiedWarning,
     FURSResponseError,
     FURSSchemaError,
+    FURSServerError,
     FURSSignatureError,
+    FURSSystemError,
     FURSTLSVerificationDisabledWarning,
 )
+from furs_fiscal.exceptions import from_furs_error
 from furs_fiscal.transport import (
+    FURS_TLS_CIPHERS,
     Connector,
     _load_ssl_context_with_client_cert,
 )
@@ -90,6 +96,114 @@ def test_in_memory_cert_loader_does_not_leave_temp_files(p12_data_and_key, tmp_p
     assert ctx is not None
     assert isinstance(key, rsa.RSAPrivateKey)
     assert cert.subject.rfc4514_string()
+
+
+def test_ssl_context_pins_tls12_minimum_and_aead_ciphers(p12_data_and_key):
+    """Spec sec. 2 requires TLS 1.2+; sec. 6.2 restricts TLS 1.2 cipher suites
+    to the AEAD ECDHE/DHE-RSA subset present in both the test (6.2.1) and
+    production (6.2.2) lists. Both must be applied regardless of whether
+    verify_tls is True, False, or a CA bundle path.
+    """
+    p12_data, _ = p12_data_and_key
+
+    # Cover the str-path branch in _load_ssl_context_with_client_cert.
+    # ssl.create_default_context(cafile=...) requires a real PEM file; the
+    # system trust store is the simplest one we can rely on cross-platform.
+    system_cafile = ssl.get_default_verify_paths().cafile
+    if not system_cafile or not os.path.exists(system_cafile):
+        pytest.skip("system CA bundle not available for cafile-branch coverage")
+
+    for verify_tls in (True, False, system_cafile):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FURSTLSVerificationDisabledWarning)
+            ctx, _, _ = _load_ssl_context_with_client_cert(
+                p12_data=p12_data, p12_password=P12_PASSWORD, verify_tls=verify_tls
+            )
+        assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+        # Every active TLS 1.2 cipher must be ECDHE-RSA / DHE-RSA + AESGCM.
+        # Names follow OpenSSL conventions ("ECDHE-RSA-AES128-GCM-SHA256"
+        # etc.). TLS 1.3 ciphers (TLS_AES_*_GCM_SHA*) are configured
+        # separately and not filtered by set_ciphers(). The cipher string in
+        # transport.py uses ``+aRSA`` to drop ECDSA / DSS-keyed AEAD suites
+        # that are unreachable against the FURS RSA cert anyway; assert that
+        # explicitly so a future widening of FURS_TLS_CIPHERS cannot silently
+        # let them through.
+        tls12_names: list[str] = []
+        for cipher in ctx.get_ciphers():
+            name = cipher["name"]
+            if name.startswith("TLS_"):
+                continue  # TLS 1.3 — separate negotiation
+            tls12_names.append(name)
+            assert "GCM" in name, f"non-AEAD TLS 1.2 cipher leaked through: {name}"
+            assert name.startswith(("ECDHE-RSA-", "DHE-RSA-")), (
+                f"non-RSA-PFS TLS 1.2 cipher leaked through: {name}"
+            )
+            assert "-DSS-" not in name and "-ECDSA-" not in name, (
+                f"non-RSA-keyed TLS 1.2 cipher leaked through: {name}"
+            )
+        # And as a positive check: the spec intersection is exactly the four
+        # RSA AEAD suites. If OpenSSL silently drops one (eg. a build with
+        # 128-bit AES disabled), the handshake against FURS will fail in
+        # production; surface it here instead.
+        assert set(tls12_names) == {
+            "ECDHE-RSA-AES128-GCM-SHA256",
+            "ECDHE-RSA-AES256-GCM-SHA384",
+            "DHE-RSA-AES128-GCM-SHA256",
+            "DHE-RSA-AES256-GCM-SHA384",
+        }, f"unexpected TLS 1.2 cipher set: {sorted(tls12_names)}"
+
+
+# ---------------------------------------------------------------------------
+# Cipher list rotation surveillance — same yellow-then-red pattern used for
+# the FURS-published cert expiry checks in tests/test_real_cert.py. Spec
+# sec. 6.2.2 v3.2 is documented as "active until 12.5.2026". When the
+# production list rotates, FURS_TLS_CIPHERS must be re-verified against the
+# successor list (6.2.2 v3.3+) before the rotation date or handshakes will
+# silently break.
+#
+# When this turns yellow:
+#   1. Pull the latest TehnicnaDokumentacijaVer*.pdf and read sec. 6.2.2.
+#   2. Confirm the intersection with sec. 6.2.1 still includes all four
+#      AEAD ECDHE/DHE-RSA suites currently selected by FURS_TLS_CIPHERS.
+#   3. If the new list drops one, update FURS_TLS_CIPHERS and the comment
+#      above it. If the new list is broader, just bump the constant below.
+# ---------------------------------------------------------------------------
+
+CIPHER_LIST_ROTATION_WARNING_DAYS = 30
+FURS_PROD_CIPHER_LIST_ACTIVE_UNTIL = datetime(2026, 5, 12, tzinfo=timezone.utc)
+
+
+def test_furs_tls_cipher_list_rotation_surveillance():
+    """Surveillance: emit a UserWarning if the FURS production cipher list
+    (spec sec. 6.2.2) rotates within ``CIPHER_LIST_ROTATION_WARNING_DAYS``
+    days; fail outright once the rotation date has passed so the next CI
+    run reminds the maintainer to re-verify FURS_TLS_CIPHERS against the
+    successor spec list. The constant being surveilled is imported and
+    referenced here so a rename will trip this test, not silently bypass
+    it.
+    """
+    assert FURS_TLS_CIPHERS  # constant must exist; renames must update us
+    days_left = (
+        FURS_PROD_CIPHER_LIST_ACTIVE_UNTIL - datetime.now(tz=timezone.utc)
+    ).days
+    assert days_left > 0, (
+        "FURS production cipher list (spec sec. 6.2.2) rotated "
+        f"{-days_left} day(s) ago "
+        f"(active_until={FURS_PROD_CIPHER_LIST_ACTIVE_UNTIL.date().isoformat()}). "
+        "Re-verify FURS_TLS_CIPHERS against the successor list in the "
+        "current TehnicnaDokumentacijaVer*.pdf and bump "
+        "FURS_PROD_CIPHER_LIST_ACTIVE_UNTIL."
+    )
+    if days_left < CIPHER_LIST_ROTATION_WARNING_DAYS:
+        warnings.warn(
+            "FURS production cipher list (spec sec. 6.2.2) rotates in "
+            f"{days_left} day(s) "
+            f"(active_until={FURS_PROD_CIPHER_LIST_ACTIVE_UNTIL.date().isoformat()}) "
+            "— re-verify FURS_TLS_CIPHERS against the successor list before "
+            "the rotation date.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def test_disabled_tls_warns(p12_data_and_key):
@@ -287,6 +401,36 @@ def test_post_raises_certificate_error_on_s004(p12_data_and_key):
                 conn.post(path="v1/cash_registers/invoices", payload={})
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "code,expected_cls,is_retryable",
+    [
+        ("S001", FURSSchemaError, False),
+        ("S002", FURSSchemaError, False),
+        # Case-insensitive (production has sent lower-case).
+        ("s002", FURSSchemaError, False),
+        ("S003", FURSSignatureError, False),
+        ("S004", FURSCertificateError, False),
+        ("S005", FURSCertificateError, False),  # tax-number / cert mismatch
+        ("S006", FURSBusinessPremiseError, False),  # premise not registered
+        ("S007", FURSCertificateError, False),  # cert revoked
+        ("S008", FURSCertificateError, False),  # cert expired
+        ("S100", FURSSystemError, True),  # transient server-side
+        ("S999", FURSServerError, False),  # unknown → catch-all
+    ],
+)
+def test_from_furs_error_maps_spec_section_4_codes(code, expected_cls, is_retryable):
+    """Spec sec. 4 enumerates S001..S008 and S100. Each must resolve to the
+    most specific exception class in the hierarchy so callers can branch
+    without parsing strings, and ``is_retryable`` must be True only for the
+    codes documented as transient server-side conditions.
+    """
+    err = from_furs_error(code, "msg")
+    assert isinstance(err, expected_cls)
+    assert err.code == code
+    assert err.message == "msg"
+    assert err.is_retryable is is_retryable
 
 
 def test_post_handles_non_200_status(p12_data_and_key):
