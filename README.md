@@ -1,213 +1,290 @@
 # python-furs-fiscal
 
-[![Join the chat at https://gitter.im/boris-savic/python-furs-fiscal](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/boris-savic/python-furs-fiscal?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-Python library for simplified communication with  FURS (Finančna uprava Republike Slovenije).
+Typed, modern Python client for the **Slovenian FURS** (Finančna uprava Republike Slovenije) v3.2 fiscal-verification web service. Targets the official [`TehnicnaDokumentacijaVer3.2.pdf`](https://www.datoteke.fu.gov.si/dpr/files/TehnicnaDokumentacijaVer3.2.pdf) and the JSON schemas published alongside it.
 
+> **2.0 is a complete rewrite.** It has different installation, different API shape, different defaults, and different behaviour from 1.x. See **[Migrating from 1.x](#migrating-from-1x)** at the bottom if you are upgrading.
 
+## Features
+
+* **Pydantic-typed wire models** — payloads are constructed and validated by models that mirror `FiscalVerificationSchema*.json` exactly. Wrong field names, missing required fields, out-of-range values, or malformed identifiers are rejected before any HTTP traffic.
+* **Decimal-only money** — `float` is rejected to eliminate silent IEEE-754 precision loss. Amounts that cannot round-trip through `float64` (i.e. close to the schema's ±100 trillion limit) are also rejected so the on-the-wire payload always matches the ZOI input.
+* **Timezone-aware datetimes everywhere** — naive datetimes are rejected. All datetimes are auto-converted to `Europe/Ljubljana` before formatting per FURS spec.
+* **Minimised on-disk key exposure** — PEMs are written to `mkstemp` (mode `0600`) only for the duration of `ssl.SSLContext.load_cert_chain`, then immediately unlinked. After that brief window the key material lives only in the SSLContext for the connector's lifetime. (Fully memory-only mTLS is not possible with stdlib `ssl`, which requires file paths.)
+* **Secure-by-default** — `verify_tls=True` and `verify_furs_response='x5c-untrusted'` are the defaults. The strongest mode (`verify_furs_response=True` with a pinned public key) is one parameter away.
+* **Granular exception hierarchy** — `FURSSchemaError`, `FURSSignatureError`, `FURSCertificateError`, `FURSServerError`, `FURSBatchError` (with per-record `record_errors` and `successes`), `FURSConnectionError`, `FURSValidationError`. Catch what you can act on.
+* **Replay-tested against the official FURS samples** — `tests/test_replay.py` decodes every signed example in `specs/examples/`, builds the same payload via the library, and asserts byte equivalence (modulo the per-message Header) plus JSON Schema validation.
 
 ## Installation
 
-    $ pip install furs_fiscal
+    pip install furs_fiscal
+
+Requires Python 3.10+. Dependencies: `cryptography`, `PyJWT`, `httpx`, `pydantic`. (`jsonschema` and `hypothesis` are dev-only.)
 
 ## Quick Start
 
-
-### Registering Immovable Business Premise
-
-Registering new Business Premises is simple. But you will need to obtain certain information
-from your client such as:
-
- * Real Estate Cadastral Number
- * Real Estate Building Number
- * Real Estate Building Section Number
-
-One thing you should also keep in mind is your premise address - if your premise is located at **Trzaska cesta 24A** you will need to pass house number **24** and additional number **A** as separate parameters.
-If your street does not have additional house number/letter just pass None.
-
 ```python
-from furs_fiscal.api import FURSBusinessPremiseAPI
-
-api = FURSBusinessPremiseAPI(p12_path='my_cert.p12',
-                             p12_password='cert_pass',
-                             production=True, request_timeout=2.0)
-
-api.register_immovable_business_premise(tax_number=10039856,
-                                        premise_id='BP101',
-                                        real_estate_cadastral_number=112,
-                                        real_estate_building_number=11,
-                                        real_estate_building_section_number=1,
-                                        street='Trzaska cesta',
-                                        house_number='24',
-                                        house_number_additional='A',
-                                        community='Ljubljana',
-                                        city='Ljubljana',
-                                        postal_code='1000',
-                                        validity_date=datetime.now() - timedelta(days=60),
-                                        software_supplier_tax_number=24564444,
-                                        foreign_software_supplier_name=None,
-                                        special_notes='/')
-```
-
-**NOTE**: As of 23.11.2015 FURS does require you to send some kind of Special note to them. Empty string will raise
-invalid JSON on their side.
-
-### Registering Movable Business Premise
-
-In order to register Movable Business Premise you will need to define one of three types:
-
- * **TYPE_MOVABLE_PREMISE_A**: Movable object such as vehicle, movable stand etc.
- * **TYPE_MOVABLE_PREMISE_B**: Object at permanent location such as news stand, market stand etc.
- * **TYPE_MOVABLE_PREMISE_C**: Individual electronic device in cases when the company does not use other business premises
-
-
-```python
-from furs_fiscal.api import FURSBusinessPremiseAPI, TYPE_MOVABLE_PREMISE_A
-
-api = FURSBusinessPremiseAPI(p12_path='my_cert.p12',
-                             p12_password='cert_pass',
-                             production=True,
-                             request_timeout=2.0)
-
-api.register_movable_business_premise(tax_number=10039856,
-                                      premise_id='BP102',
-                                      movable_type=TYPE_MOVABLE_PREMISE_A,
-                                      validity_date=datetime.now() - timedelta(days=60),
-                                      software_supplier_tax_number=24564444,
-                                      foreign_software_supplier_name=None,
-                                      special_notes='')
-
-```
-
-### Calculate Invoice ZOI - Protected ID
-
-At the end of every Invoice your should print ZOI (Protected ID). To obtain it follow the next procedure:
-
-```python
-from furs_fiscal.api import FURSInvoiceAPI
-
-api = FURSInvoiceAPI(p12_path='my_cert.p12',
-                     p12_password='cert_pass',
-                     production=False,
-                     request_timeout=1.0)
-
-date_issued = datetime.now()
-
-zoi = api.calculate_zoi(tax_number=10039856,
-                        issued_date=date_issued,
-                        invoice_number='11',
-                        business_premise_id='BP101',
-                        electronic_device_id='B1',
-                        invoice_amount=Decimal('19.15'))
-
-```
-
-### Generate Data for QR/Code128/PDF417
-
-You're supposed to print QR Code/Code128 or PDF 417 on every invoice after the ZOI. To obtain the data for QR/Code128/PDF417 perform the following method call on **FURSInvoiceAPI** object.
-
-```python
-qr_data = api.prepare_printable(tax_number=10039856,
-                                zoi=zoi,
-                                issued_date=date_issued)
-```
-
-### Get EOR From FURS
-
-To obtain FURS EOR code - UniqueID, you'll have to call the following method. It provides several other parameters,
-for issuing invoice storno and special tax rules. Please read the full documentation.
-
-```python
+from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
-# In most cases there will be just one seller - company that issues the invoice.
-# For some cases you may need to include more sellers. In that case,
-# do not forget to set seller_tax_number for the other sellers.
-seller_one = TaxesPerSeller(other_taxes_amount=None,
-                            exempt_vat_taxable_amount=None,
-                            reverse_vat_taxable_amount=None,
-                            non_taxable_amount=Decimal('0.00'),
-                            special_tax_rules_amount=None,
-                            seller_tax_number=None)
+from furs_fiscal import (
+    FURSClient,
+    Invoice,
+    InvoiceIdentifier,
+    TaxesPerSeller,
+    VATAmount,
+)
 
-seller_one.add_vat_amount(tax_rate=Decimal('22.00'),
-                          tax_base=Decimal('23.14'),
-                          tax_amount=Decimal('5.09'))
-seller_one.add_vat_amount(tax_rate=Decimal('9.50'),
-                          tax_base=Decimal('35.14'),
-                          tax_amount=Decimal('3.34'))
-# 5% VAT - for books etc.
-seller_one.add_vat_amount(tax_rate=Decimal('5.00'),
-                          tax_base=Decimal('10.00'),
-                          tax_amount=Decimal('0.50'))
+with FURSClient(
+    p12_data=Path("client.p12").read_bytes(),
+    p12_password="cert-password",
+    production=False,                  # use the FURS test endpoint
+    verify_tls=True,                    # system CA store; pass a path for SIGOV-CA pinning
+    verify_furs_response="x5c-untrusted",
+) as client:
 
-eor = api.get_invoice_eor(zoi=zoi,
-                          tax_number=10039856,
-                          issued_date=date_issued,
-                          invoice_number='11',
-                          business_premise_id='BP101',
-                          electronic_device_id='B1',
-                          invoice_amount=Decimal('66.71'),
-                          payment_amount=Decimal('0.00'),
-                          returns_amount=Decimal('0.00'),
-                          taxes_per_seller=seller_one,  # Single TaxesPerSeller or a list is supported.
-                          operator_tax_number=12345678)
+    issued = datetime.now(tz=timezone.utc)
+
+    zoi = client.calculate_zoi(
+        tax_number=10039856,
+        issued_date=issued,
+        invoice_number="11",
+        business_premise_id="BP1",
+        electronic_device_id="B1",
+        invoice_amount=Decimal("19.15"),
+    )
+
+    invoice = Invoice(
+        tax_number=10039856,
+        issue_date_time=issued,
+        numbering_structure="B",
+        invoice_identifier=InvoiceIdentifier(
+            business_premise_id="BP1",
+            electronic_device_id="B1",
+            invoice_number="11",
+        ),
+        invoice_amount=Decimal("19.15"),
+        payment_amount=Decimal("19.15"),
+        taxes_per_seller=[
+            TaxesPerSeller(vat=[
+                VATAmount(
+                    tax_rate=Decimal("22"),
+                    taxable_amount=Decimal("15.70"),
+                    tax_amount=Decimal("3.45"),
+                ),
+            ]),
+        ],
+        protected_id=zoi,
+    )
+
+    eor = client.submit_invoice(invoice)
+
+    qr_data = client.prepare_printable(
+        tax_number=10039856, zoi=zoi, issued_date=issued
+    )
 ```
 
-Invoice and tax amount fields accept numeric values, including `Decimal` instances. Values are validated to be finite, to contain at most two decimal places, and to fit the official FURS JSON-schema ranges before JSON serialization. Explicit zero amounts are preserved in generated payloads, so `payment_amount=Decimal('0.00')`, `returns_amount=Decimal('0.00')`, and zero-valued tax fields are sent to FURS. `taxes_per_seller` is required and must contain at least one `TaxesPerSeller` instance.
+## Registering Business Premises
 
-`operator_tax_number` and `foreign_operator=True` are mutually exclusive. Reference invoice fields can be passed as scalar values for a single reference, or as parallel lists of equal length for multiple references. Electronic invoices also support references to pre-numbered invoice-book invoices through `reference_sales_book_*` fields. `SpecialNotes` is included whenever a non-empty value is provided.
-
-Invoice issue/reference datetimes and request header timestamps are formatted as `YYYY-MM-DDTHH:MM:SS` without a `Z` suffix or offset. Business premise validity dates and sales-book dates are formatted as `YYYY-MM-DD`.
-
-FURS v3.2 additions are supported for vending-machine business premises via `register_vending_machine_business_premise()`, flat-rate compensation via `TaxesPerSeller.add_flat_rate_compensation()`, and batch submission via `submit_invoice_batch()` and `register_business_premises_batch()`. Batch methods expect already-built payload dictionaries and submit them to the official `cash_registers_batch` endpoints.
-
-TLS server verification is configurable through `verify_tls`: keep the legacy default `False`, pass `True` to use the system CA store, or pass a CA bundle path for SIGOV-CA/SI-TRUST pinning. FURS response JWS verification can be enabled with `verify_furs_response=True` and `furs_response_public_key`; by default responses are decoded without signature verification for backwards compatibility.
-
-### Certificate Temporary Files
-
-`Connector` writes certificate and private-key material from the `.p12` file into temporary PEM files because `requests` requires filesystem paths for mutual TLS client certificates. Call `close()` when you are finished with an API instance to remove those temporary files:
+### Immovable premise (with property ID + address)
 
 ```python
-api = FURSInvoiceAPI(p12_path='my_cert.p12',
-                     p12_password='cert_pass',
-                     production=False,
-                     request_timeout=1.0)
-try:
-    # Use the API here.
-    pass
-finally:
-    api.close()
+from datetime import date
+from furs_fiscal import (
+    Address, BPIdentifier, BusinessPremise, PropertyID, RealEstateBP,
+    SoftwareSupplier,
+)
+
+bp = BusinessPremise(
+    tax_number=10039856,
+    business_premise_id="BP1",
+    bp_identifier=BPIdentifier(
+        real_estate_bp=RealEstateBP(
+            property_id=PropertyID(
+                cadastral_number=365,
+                building_number=12,
+                building_section_number=3,
+            ),
+            address=Address(
+                street="Tržaška cesta",
+                house_number="24",
+                house_number_additional="B",
+                community="Ljubljana",
+                city="Ljubljana",
+                postal_code="1000",
+            ),
+        )
+    ),
+    validity_date=date.today(),
+    software_supplier=[SoftwareSupplier(tax_number=24564444)],
+    special_notes="Glavna trgovina",
+)
+client.submit_business_premise(bp)
 ```
 
-The API classes and the underlying `Connector` also support context-manager cleanup.
+### Movable premise (type A/B/C)
+
+```python
+bp = BusinessPremise(
+    tax_number=10039856,
+    business_premise_id="MOB1",
+    bp_identifier=BPIdentifier(premise_type="A"),
+    validity_date=date.today(),
+    software_supplier=[SoftwareSupplier(tax_number=24564444)],
+)
+client.submit_business_premise(bp)
+```
+
+### Vending machine (type D/E/F, address OR geolocation)
+
+```python
+from furs_fiscal import Geolocation, VendingMachine
+
+bp = BusinessPremise(
+    tax_number=10039856,
+    business_premise_id="VM1",
+    bp_identifier=BPIdentifier(
+        vending_machine=VendingMachine(
+            vending_premise_type="E",
+            geolocation=Geolocation(
+                latitude=Decimal("46.056946"),
+                longitude=Decimal("14.505751"),
+            ),
+        )
+    ),
+    validity_date=date.today(),
+    software_supplier=[SoftwareSupplier(tax_number=24564444)],
+)
+client.submit_business_premise(bp)
+```
+
+## Sales-Book Invoices (vezana knjiga)
+
+```python
+from furs_fiscal import SalesBookIdentifier, SalesBookInvoice
+
+sbi = SalesBookInvoice(
+    tax_number=10039856,
+    issue_date=date.today(),
+    sales_book_identifier=SalesBookIdentifier(
+        invoice_number="612", set_number="03", serial_number="5001-0001018",
+    ),
+    business_premise_id="BP1",
+    invoice_amount=Decimal("19.15"),
+    payment_amount=Decimal("19.15"),
+    taxes_per_seller=[TaxesPerSeller(nontaxable_amount=Decimal("0.00"))],
+)
+eor = client.submit_sales_book_invoice(sbi)
+```
+
+`SalesBookInvoice` does **not** support `OperatorTaxNumber` (the official schema does not allow it for sales-book payloads).
+
+## Batch Submission
+
+```python
+from furs_fiscal import FURSBatchError
+
+try:
+    successes = client.submit_invoice_batch([invoice_1, invoice_2, ...])
+    # successes: dict[int, {"ProtectedID": str, "UniqueInvoiceID": str}]
+except FURSBatchError as exc:
+    for record_no, err in exc.record_errors.items():
+        log.error("record %d failed: %s", record_no, err)
+    for record_no, ok in exc.successes.items():
+        mark_done(record_no, ok["UniqueInvoiceID"])  # don't resubmit these
+```
+
+A batch must contain 2..500 records. The transport layer raises a `FURSBatchError` whenever any record reply contains an `Error` block; successful records remain accessible on the exception so callers can persist the EORs without resubmitting.
+
+## Security: TLS and FURS Response Verification
+
+### `verify_tls`
+
+| Value          | Behaviour                                                                                  |
+|----------------|--------------------------------------------------------------------------------------------|
+| `True`         | (default) System CA store.                                                                  |
+| `str` (path)   | Pin against a CA bundle file. Recommended for production with the SIGOV-CA chain.           |
+| `False`        | Disable verification. Emits `FURSTLSVerificationDisabledWarning`. Use only for offline tests. |
+
+### `verify_furs_response`
+
+| Value              | Behaviour                                                                                                                                                                                                       |
+|--------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `'x5c-untrusted'`  | (default) Verifies the response signature with the certificate embedded in the JWS `x5c` header. Validity window is checked; chain is **not**. Emits `FURSResponseChainNotVerifiedWarning`. Only signature self-consistency. |
+| `True`             | Verifies against `furs_response_public_key` (required). The constructor raises `ValueError` if no key is supplied. The only MITM-resistant mode.                                                                |
+| `False`            | Skips signature verification entirely. Discouraged.                                                                                                                                                              |
+
+For real MITM protection in production, combine `verify_tls=<sigov-ca-path>` with `verify_furs_response=True` plus the published FURS response signing public key.
+
+## Exception Hierarchy
+
+```
+FURSError
+├── FURSValidationError       — local validation failed (also a ValueError)
+├── FURSConnectionError       — transport / decode failure
+├── FURSResponseError         — FURS returned an Error envelope
+│   ├── FURSSchemaError       — S001 / S002
+│   ├── FURSSignatureError    — S003
+│   ├── FURSCertificateError  — S004
+│   └── FURSServerError       — every other code
+└── FURSBatchError            — one or more records in a batch failed
+                                (record_errors: dict[int, FURSResponseError],
+                                 successes:     dict[int, {ProtectedID, UniqueInvoiceID}])
+```
+
+## ZOI and Printable QR/Code-128 Data
+
+```python
+zoi = client.calculate_zoi(
+    tax_number=10039856,
+    issued_date=datetime.now(tz=timezone.utc),
+    invoice_number="11",
+    business_premise_id="BP1",
+    electronic_device_id="B1",
+    invoice_amount=Decimal("19.15"),
+)
+printable = client.prepare_printable(
+    tax_number=10039856, zoi=zoi, issued_date=datetime.now(tz=timezone.utc)
+)
+```
+
+Both inputs MUST be timezone-aware. `prepare_printable` converts to `Europe/Ljubljana` per spec; `calculate_zoi` uses the same conversion so the ZOI matches the value FURS later receives in the JSON payload.
 
 ## Running Tests
 
-Regression tests are available under `tests/`. After installing test dependencies, run:
-
 ```bash
-python -m pytest tests/test_api_regressions.py
-python -m pytest tests/test_schema_payloads.py
+pip install -e ".[dev]"
+pytest
 ```
 
-## Contributing
+The suite (88 tests) covers:
 
-This library should be sufficient to integrate into your software as is, but there is still some work that needs to be done.
+* **Models** — pydantic validation, IEEE-754 round-trip safety, datetime conversion, mutual-exclusion rules, batch envelope construction. Property-based tests via `hypothesis`.
+* **ZOI** — determinism, validation, Europe/Ljubljana wall-time semantics.
+* **Transport** — in-memory mTLS, x5c response verification (good cert / expired cert / wrong key / missing header), pinned-key mode, error envelope routing.
+* **API** — full submit flows over `httpx.MockTransport`, batch handling with per-record errors.
+* **Replay** — every official signed example in `specs/examples/` is decoded, rebuilt by the library, and compared structurally + validated against `specs/schemas/FiscalVerificationSchema*.json`.
 
-You can contribute in one of the following areas:
+## Migrating from 1.x
 
- * Detailed documentation
- * More examples for various use-cases
- * Additional FURS API regression tests
- * Packaging and CI improvements
+| 1.x                                              | 2.0                                                                                            |
+|--------------------------------------------------|------------------------------------------------------------------------------------------------|
+| `FURSInvoiceAPI(p12_path=..., p12_password=...)` | `FURSClient(p12_data=Path(...).read_bytes(), p12_password=...)`                                |
+| `FURSBusinessPremiseAPI`                         | Same `FURSClient` — call `submit_business_premise(bp)`                                          |
+| `api.get_invoice_eor(...)` (positional kwargs)   | Build `Invoice(...)` from typed fields, then `client.submit_invoice(invoice)`                   |
+| `api.get_sales_book_invoice_eor(...)`            | Build `SalesBookInvoice(...)`, then `client.submit_sales_book_invoice(sbi)`                     |
+| `register_immovable_business_premise(...)` etc.  | Build `BusinessPremise(... bp_identifier=BPIdentifier(real_estate_bp=...))`                     |
+| `TaxesPerSeller.add_vat_amount(...)`             | `TaxesPerSeller(vat=[VATAmount(...)])` — pure pydantic construction                              |
+| `verify_tls=False` default                       | `verify_tls=True` default; pass `False` only with a warning                                     |
+| `verify_furs_response=False` default             | `verify_furs_response='x5c-untrusted'` default                                                  |
+| `requests` + persistent on-disk client cert tempfiles | `httpx` + `ssl.SSLContext` loaded via `mkstemp` (0600) and unlinked immediately after `load_cert_chain` |
+| `from furs_fiscal.exceptions import FURSException` | `from furs_fiscal import FURSResponseError, FURSSchemaError, ...` (granular subclasses)         |
+| `pyOpenSSL`, `pytz` dependencies                 | Dropped — `cryptography`-only, stdlib `zoneinfo`                                                |
+| Python 2/3 support                               | Python 3.10+                                                                                    |
+| Float / int amounts accepted                     | `Decimal`, `int`, or `str` only. Float raises `FURSValidationError`/`ValidationError`.          |
+| Naive datetimes accepted                         | All datetimes must be timezone-aware. Auto-converted to `Europe/Ljubljana`.                     |
+| Per-record batch errors silently ignored         | `FURSBatchError` raised; `record_errors` and `successes` dicts on the exception                 |
 
-## Contact
+## License
 
-**Boris Savic**
-
- * Twitter: [@zitko](https://twitter.com/zitko)
- * Email: boris70@gmail.com
-
-
-
-
+MIT — see [LICENSE](LICENSE).
