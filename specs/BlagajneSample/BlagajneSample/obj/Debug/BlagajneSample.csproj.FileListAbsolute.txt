@@ -1,6 +1,0 @@
-D:\PROJEKTI\Blagajne\Davčne blagajne\BlagajneSample\BlagajneSample\bin\Debug\BlagajneSample.exe.config
-D:\PROJEKTI\Blagajne\Davčne blagajne\BlagajneSample\BlagajneSample\obj\Debug\BlagajneSample.csprojResolveAssemblyReference.cache
-D:\PROJEKTI\Blagajne\Davčne blagajne\BlagajneSample\BlagajneSample\bin\Debug\BlagajneSample.exe
-D:\PROJEKTI\Blagajne\Davčne blagajne\BlagajneSample\BlagajneSample\bin\Debug\BlagajneSample.pdb
-D:\PROJEKTI\Blagajne\Davčne blagajne\BlagajneSample\BlagajneSample\obj\Debug\BlagajneSample.exe
-D:\PROJEKTI\Blagajne\Davčne blagajne\BlagajneSample\BlagajneSample\obj\Debug\BlagajneSample.pdb

@@ -63,6 +63,12 @@ target/
 # macOS Finder metadata
 .DS_Store
 
+# Visual Studio build artifacts (specs/BlagajneSample C# reference)
+bin/
+obj/
+.vs/
+*.suo
+
 # Private certificates and key stores
 *.p12
 *.pfx
