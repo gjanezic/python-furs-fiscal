@@ -45,6 +45,7 @@ from .transport import (
     FURSResponseChainNotVerifiedWarning,
     FURSTLSVerificationDisabledWarning,
 )
+from .trust import load_furs_certificate, load_response_public_key
 from .zoi import calculate_zoi, prepare_printable
 
 __version__ = "2.0.0"
@@ -85,6 +86,9 @@ __all__ = [
     # ZOI
     "calculate_zoi",
     "prepare_printable",
+    # Trust material helpers
+    "load_furs_certificate",
+    "load_response_public_key",
     # Exceptions
     "FURSError",
     "FURSValidationError",

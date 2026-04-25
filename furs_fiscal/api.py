@@ -60,6 +60,8 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
 from .exceptions import (
     FURSBatchError,
@@ -118,6 +120,22 @@ class FURSClient:
             proxy=proxy,
             transport=transport,
         )
+
+    # -- Trust material -------------------------------------------------------
+
+    @property
+    def certificate(self) -> x509.Certificate:
+        """The client X.509 certificate parsed from the supplied PKCS#12.
+
+        Useful for inspecting the subject DN, issuer, serial, or public
+        key without reaching into the connector.
+        """
+        return self._connector.certificate
+
+    @property
+    def private_key(self) -> RSAPrivateKey:
+        """The RSA private key parsed from the supplied PKCS#12."""
+        return self._connector.private_key
 
     # -- Lifecycle ------------------------------------------------------------
 

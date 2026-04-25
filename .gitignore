@@ -60,6 +60,17 @@ target/
 # PyCharm
 *.idea/
 
+# macOS Finder metadata
+.DS_Store
+
 # Private certificates and key stores
 *.p12
 *.pfx
+# ...except the FURS-published TESTNO PODJETJE test certs, which are public
+# fixture material used by the demo + integration tests.
+!specs/test_certs/*.p12
+!demos/demo_podjetje.p12
+# specs/{test,prod}_certs/*.cer, *.crt, *.pem are FURS-published public
+# certificates (server TLS pubkey, response-signing pubkey, SIGOV-CA
+# intermediate, SI-TRUST Root, concatenated CA bundle) and intentionally
+# tracked so the demo and tests pin against them out of the box.
