@@ -1,5 +1,6 @@
-import tempfile
 import os
+import tempfile
+
 import requests
 import jwt
 
@@ -8,8 +9,6 @@ from OpenSSL.crypto import X509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization.pkcs12 import load_pkcs12
 
-
-requests.packages.urllib3.disable_warnings()
 
 FURS_TEST_ENDPOINT = 'https://blagajne-test.fu.gov.si:9002'
 FURS_PRODUCTION_ENDPOINT = 'https://blagajne.fu.gov.si:9003'
@@ -25,7 +24,15 @@ class Connector(object):
     Connector performs all the communication with the FURS server.
 
     """
-    def __init__(self, p12_path, p12_password, p12_buffer=None, production=True, request_timeout=2, proxy=None):
+    def __init__(self,
+                 p12_path,
+                 p12_password,
+                 p12_buffer=None,
+                 production=True,
+                 request_timeout=2,
+                 proxy=None,
+                 verify_tls=False,
+                 disable_tls_warnings=True):
         """
         Initializes and loads certs to memory.
 
@@ -35,6 +42,9 @@ class Connector(object):
         :param production: (boolean) Should we use FURS Production server of Test server
         :param request_timeout: (float) How long should we wait for the request to timeout
         :param proxy: (dict) Specify proxy details if you need one, for example: {"http": "http://localhost:3128", "https": "http://localhost:3128"}
+        :param verify_tls: False for legacy behaviour, True for system CA verification,
+                           or a CA bundle path for FURS/SIGOV-CA pinning.
+        :param disable_tls_warnings: Disable urllib3 warnings when verify_tls=False.
         :return: None
         """
         self.p12_path = p12_path
@@ -49,6 +59,9 @@ class Connector(object):
         self.request_timeout = request_timeout
 
         self.proxy = proxy
+        self.verify_tls = verify_tls
+        if disable_tls_warnings and verify_tls is False:
+            requests.packages.urllib3.disable_warnings()
 
         # self.furs_cert = open(self.cert, 'rt').read()
         # load certificate...
@@ -159,7 +172,7 @@ class Connector(object):
         return requests.post(url='%s/%s' % (self.endpoint, path),
                              json=data,
                              cert=(self.cert_temp.name, self.pkey_temp.name),
-                             verify=False,
+                             verify=self.verify_tls,
                              headers=self._prepare_headers(),
                              timeout=self.request_timeout,
                              proxies=self.proxy)
@@ -180,7 +193,7 @@ class Connector(object):
         return requests.post(url='%s/%s' % (self.endpoint, 'v1/cash_registers/echo'),
                              json=data,
                              cert=(self.cert_temp.name, self.pkey_temp.name),
-                             verify=False,
+                             verify=self.verify_tls,
                              headers=self._prepare_headers(),
                              timeout=self.request_timeout,
                              proxies=self.proxy)

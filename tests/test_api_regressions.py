@@ -145,7 +145,7 @@ def test_invoice_payload_preserves_zero_values_and_decimals():
     tax.add_vat_amount(tax_rate=Decimal('22.00'), tax_base=Decimal('0.00'), tax_amount=Decimal('0.00'))
 
     eor = api.get_invoice_eor(
-        zoi='abc123',
+        zoi='34905bcff14b381039af2e9d7eee54bb',
         tax_number=10039856,
         issued_date=datetime(2026, 4, 25, 8, 0, 0, tzinfo=timezone.utc),
         invoice_number='11',
@@ -174,15 +174,17 @@ def test_invoice_datetime_preserves_local_wall_time_without_timezone_suffix():
     api = build_invoice_api()
     local_issued_at = datetime(2026, 4, 25, 10, 0, 0, tzinfo=timezone(timedelta(hours=2)))
     local_reference_at = datetime(2026, 4, 24, 9, 30, 0, tzinfo=timezone(timedelta(hours=2)))
+    tax = TaxesPerSeller(non_taxable_amount=Decimal('0.00'))
 
     api.get_invoice_eor(
-        zoi='abc123',
+        zoi='34905bcff14b381039af2e9d7eee54bb',
         tax_number=10039856,
         issued_date=local_issued_at,
         invoice_number='11',
         business_premise_id='BP105',
         electronic_device_id='B1',
         invoice_amount=Decimal('66.70'),
+        taxes_per_seller=tax,
         reference_invoice_number='10',
         reference_invoice_business_premise_id='BP105',
         reference_invoice_electronic_device_id='B1',
@@ -199,31 +201,35 @@ def test_invoice_datetime_preserves_local_wall_time_without_timezone_suffix():
 
 def test_invoice_rejects_too_many_decimal_places():
     api = build_invoice_api()
+    tax = TaxesPerSeller(non_taxable_amount=Decimal('0.00'))
 
     with pytest.raises(ValueError, match='at most 2 decimal places'):
         api.get_invoice_eor(
-            zoi='abc123',
+            zoi='34905bcff14b381039af2e9d7eee54bb',
             tax_number=10039856,
             issued_date=datetime(2026, 4, 25, 8, 0, 0, tzinfo=timezone.utc),
             invoice_number='11',
             business_premise_id='BP105',
             electronic_device_id='B1',
             invoice_amount=Decimal('66.701'),
+            taxes_per_seller=tax,
         )
 
 
 def test_invoice_rejects_conflicting_operator_fields():
     api = build_invoice_api()
+    tax = TaxesPerSeller(non_taxable_amount=Decimal('0.00'))
 
     with pytest.raises(ValueError, match='mutually exclusive'):
         api.get_invoice_eor(
-            zoi='abc123',
+            zoi='34905bcff14b381039af2e9d7eee54bb',
             tax_number=10039856,
             issued_date=datetime(2026, 4, 25, 8, 0, 0, tzinfo=timezone.utc),
             invoice_number='11',
             business_premise_id='BP105',
             electronic_device_id='B1',
             invoice_amount=Decimal('66.70'),
+            taxes_per_seller=tax,
             operator_tax_number=12345678,
             foreign_operator=True,
         )
@@ -231,16 +237,18 @@ def test_invoice_rejects_conflicting_operator_fields():
 
 def test_invoice_rejects_mismatched_reference_invoice_lists():
     api = build_invoice_api()
+    tax = TaxesPerSeller(non_taxable_amount=Decimal('0.00'))
 
     with pytest.raises(ValueError, match='same length'):
         api.get_invoice_eor(
-            zoi='abc123',
+            zoi='34905bcff14b381039af2e9d7eee54bb',
             tax_number=10039856,
             issued_date=datetime(2026, 4, 25, 8, 0, 0, tzinfo=timezone.utc),
             invoice_number='11',
             business_premise_id='BP105',
             electronic_device_id='B1',
             invoice_amount=Decimal('66.70'),
+            taxes_per_seller=tax,
             reference_invoice_number=['10', '11'],
             reference_invoice_business_premise_id=['BP105'],
             reference_invoice_electronic_device_id=['B1', 'B1'],
@@ -250,6 +258,7 @@ def test_invoice_rejects_mismatched_reference_invoice_lists():
 
 def test_sales_book_reference_date_is_date_only():
     api = build_invoice_api()
+    tax = TaxesPerSeller(non_taxable_amount=Decimal('0.00'))
 
     api.get_sales_book_invoice_eor(
         tax_number=10039856,
@@ -259,6 +268,7 @@ def test_sales_book_reference_date_is_date_only():
         set_number='03',
         serial_number='5001-0001018',
         invoice_amount=Decimal('66.70'),
+        taxes_per_seller=tax,
         reference_sales_book_number='611',
         reference_sales_book_set_number='03',
         reference_sales_book_serial_number='5001-0001017',
@@ -283,6 +293,19 @@ def test_software_supplier_tax_number_still_wins_over_foreign_name():
     assert message['BusinessPremiseRequest']['BusinessPremise']['SoftwareSupplier'] == [{'TaxNumber': 24564444}]
 
 
+def test_software_supplier_requires_tax_number_or_foreign_name():
+    with pytest.raises(ValueError, match='software_supplier_tax_number'):
+        FURSBusinessPremiseAPI._build_common_message_body(
+            tax_number=10039856,
+            premise_id='BP105',
+            validity_date=datetime(2026, 4, 25, 8, 0, 0, tzinfo=timezone.utc),
+            software_supplier_tax_number=None,
+            foreign_software_supplier_name=None,
+            special_notes='No notes',
+            close=False,
+        )
+
+
 def test_connection_exception_code_is_not_tuple():
     exc = ConnectionException(code=500, message='error')
 
@@ -304,3 +327,26 @@ def test_connector_close_removes_temp_files():
     assert not os.path.exists(pkey_name)
     assert connector.cert_temp is None
     assert connector.pkey_temp is None
+
+
+def test_connector_accepts_configurable_tls_verification():
+    connector = build_test_certificate_connector()
+    try:
+        assert connector.verify_tls is False
+    finally:
+        connector.close()
+
+
+def test_invoice_rejects_missing_taxes_per_seller():
+    api = build_invoice_api()
+
+    with pytest.raises(ValueError, match='taxes_per_seller'):
+        api.get_invoice_eor(
+            zoi='34905bcff14b381039af2e9d7eee54bb',
+            tax_number=10039856,
+            issued_date=datetime(2026, 4, 25, 8, 0, 0, tzinfo=timezone.utc),
+            invoice_number='11',
+            business_premise_id='BP105',
+            electronic_device_id='B1',
+            invoice_amount=Decimal('66.70'),
+        )

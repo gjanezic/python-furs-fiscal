@@ -23,10 +23,6 @@ venv/
 *.egg-info/
 .installed.cfg
 *.egg
-.kilocode/
-AGENTS.md
-plans/
-specs/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

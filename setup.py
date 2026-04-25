@@ -17,5 +17,6 @@ setup(
         'requests>=2.20.0',
         'PyJWT>=2.8.0',
         'pyOpenSSL>=17.5.0',
+        'jsonschema>=4.0.0',
     ]
 )

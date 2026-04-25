@@ -11,13 +11,35 @@ from furs_fiscal.exceptions import ConnectionException, ConnectionTimedOutExcept
 
 
 class FURSBaseAPI(object):
-    def __init__(self, p12_path, p12_password, p12_buffer=None, production=True, request_timeout=2.0, proxy=None):
+    def __init__(self,
+                 p12_path,
+                 p12_password,
+                 p12_buffer=None,
+                 production=True,
+                 request_timeout=2.0,
+                 proxy=None,
+                 verify_tls=False,
+                 furs_response_public_key=None,
+                 verify_furs_response=False):
         self.connector = Connector(p12_path=p12_path,
                                    p12_password=p12_password,
                                    p12_buffer=p12_buffer,
                                    production=production,
                                    request_timeout=request_timeout,
-                                   proxy=proxy)
+                                   proxy=proxy,
+                                   verify_tls=verify_tls)
+        self.furs_response_public_key = furs_response_public_key
+        self.verify_furs_response = verify_furs_response
+
+    def close(self):
+        self.connector.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
 
     def is_server_accessible(self):
         """
@@ -53,7 +75,15 @@ class FURSBaseAPI(object):
                 # TODO - we should verify server signature!
                 try:
                     token = response.json()['token']
-                    server_response = jwt.decode(token, options={"verify_signature": False})
+                    if self.verify_furs_response:
+                        if self.furs_response_public_key is None:
+                            raise ConnectionException(code='MISSING_RESPONSE_PUBLIC_KEY',
+                                                      message='FURS response verification requires furs_response_public_key')
+                        server_response = jwt.decode(token,
+                                                     key=self.furs_response_public_key,
+                                                     algorithms=['RS256'])
+                    else:
+                        server_response = jwt.decode(token, options={"verify_signature": False})
                 except (ValueError, KeyError, jwt.PyJWTError) as e:
                     raise ConnectionException(code='INVALID_RESPONSE',
                                               message='FURS response did not contain a valid token') from e

@@ -1,8 +1,10 @@
-import pytz
 import hashlib
+import re
 import uuid
 import datetime
 from decimal import Decimal, InvalidOperation
+
+import pytz
 
 from furs_fiscal.base_api import FURSBaseAPI
 
@@ -11,11 +13,21 @@ TYPE_MOVABLE_PREMISE_A = 'A'
 TYPE_MOVABLE_PREMISE_B = 'B'
 TYPE_MOVABLE_PREMISE_C = 'C'
 
+TYPE_VENDING_MACHINE_D = 'D'
+TYPE_VENDING_MACHINE_E = 'E'
+TYPE_VENDING_MACHINE_F = 'F'
+
 NUMBERING_STRUCTURE_CENTRAL = 'C'
 NUMBERING_STRUCTURE_DEVICE = 'B'
 
 REGISTER_BUSINESS_UNIT_PATH = 'v1/cash_registers/invoices/register'
+REGISTER_BUSINESS_UNIT_BATCH_PATH = 'v1/cash_registers_batch/invoices/register'
 INVOICE_ISSUE_PATH = 'v1/cash_registers/invoices'
+INVOICE_ISSUE_BATCH_PATH = 'v1/cash_registers_batch/invoices'
+
+_IDENTIFIER_RE = re.compile(r'^[0-9a-zA-Z]{1,20}$')
+_INVOICE_NUMBER_RE = re.compile(r'^[1-9][0-9]{0,19}$')
+_ZOI_RE = re.compile(r'^[0-9a-fA-F]{32}$')
 
 
 def _format_datetime(value):
@@ -26,41 +38,117 @@ def _format_date(value):
     return value.strftime("%Y-%m-%d")
 
 
-def _normalize_decimal_number(value, max_decimals=2):
+def _validate_text(value, field_name, min_length=1, max_length=None, pattern=None):
+    if not isinstance(value, str):
+        raise ValueError("%s must be a string" % field_name)
+    if len(value) < min_length:
+        raise ValueError("%s must contain at least %s characters" % (field_name, min_length))
+    if max_length is not None and len(value) > max_length:
+        raise ValueError("%s must contain at most %s characters" % (field_name, max_length))
+    if pattern is not None and not pattern.match(value):
+        raise ValueError("%s has invalid format" % field_name)
+    return value
+
+
+def _validate_identifier(value, field_name):
+    return _validate_text(value, field_name, max_length=20, pattern=_IDENTIFIER_RE)
+
+
+def _validate_invoice_number(value, field_name='invoice_number'):
+    return _validate_text(str(value), field_name, max_length=20, pattern=_INVOICE_NUMBER_RE)
+
+
+def _validate_sales_book_set_number(value, field_name='set_number'):
+    return _validate_text(str(value), field_name, min_length=2, max_length=2)
+
+
+def _validate_sales_book_serial_number(value, field_name='serial_number'):
+    return _validate_text(str(value), field_name, min_length=12, max_length=12)
+
+
+def _validate_tax_number(value, field_name='tax_number'):
+    if isinstance(value, bool):
+        raise ValueError("%s must be an 8-digit integer" % field_name)
+    try:
+        tax_number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("%s must be an 8-digit integer" % field_name) from exc
+    if tax_number < 10000000 or tax_number > 99999999:
+        raise ValueError("%s must be an 8-digit integer between 10000000 and 99999999" % field_name)
+    return tax_number
+
+
+def _validate_postal_code(value):
+    return _validate_text(str(value), 'postal_code', min_length=4, max_length=4)
+
+
+def _normalize_decimal_number(value, max_decimals=2, minimum=None, maximum=None, field_name='Decimal number'):
     if value is None:
         return None
 
     try:
         decimal_value = Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
-        raise ValueError("Decimal number fields must be valid numeric values") from exc
+        raise ValueError("%s fields must be valid numeric values" % field_name) from exc
 
     if not decimal_value.is_finite():
-        raise ValueError("Decimal number fields must be finite numeric values")
+        raise ValueError("%s fields must be finite numeric values" % field_name)
 
     quant = Decimal(1).scaleb(-max_decimals)
     try:
         quantized = decimal_value.quantize(quant)
     except InvalidOperation as exc:
-        raise ValueError("Decimal number fields must be valid numeric values") from exc
+        raise ValueError("%s fields must be valid numeric values" % field_name) from exc
 
     if decimal_value != quantized:
-        raise ValueError("Decimal number fields support at most %s decimal places" % max_decimals)
+        raise ValueError("%s fields support at most %s decimal places" % (field_name, max_decimals))
+
+    if minimum is not None and quantized <= Decimal(str(minimum)):
+        raise ValueError("%s fields must be greater than %s" % (field_name, minimum))
+    if maximum is not None and quantized >= Decimal(str(maximum)):
+        raise ValueError("%s fields must be less than %s" % (field_name, maximum))
 
     if quantized == quantized.to_integral_value():
         return int(quantized)
     return float(quantized)
 
 
-def _ensure_taxes_per_seller_list(taxes_per_seller):
+def _normalize_amount(value):
+    return _normalize_decimal_number(value,
+                                     max_decimals=2,
+                                     minimum='-100000000000000',
+                                     maximum='100000000000000',
+                                     field_name='Amount')
+
+
+def _normalize_tax_rate(value):
+    return _normalize_decimal_number(value,
+                                     max_decimals=2,
+                                     minimum='-99999.01',
+                                     maximum='99999.01',
+                                     field_name='Tax rate')
+
+
+def _normalize_geolocation(value, max_abs, field_name):
+    return _normalize_decimal_number(value,
+                                     max_decimals=6,
+                                     minimum=str(-max_abs - Decimal('0.000001')),
+                                     maximum=str(max_abs + Decimal('0.000001')),
+                                     field_name=field_name)
+
+
+def _ensure_taxes_per_seller_list(taxes_per_seller, required=True):
     if taxes_per_seller is None:
-        return []
-    if isinstance(taxes_per_seller, TaxesPerSeller):
-        return [taxes_per_seller]
-    if not isinstance(taxes_per_seller, list):
+        taxes_per_seller = []
+    elif isinstance(taxes_per_seller, TaxesPerSeller):
+        taxes_per_seller = [taxes_per_seller]
+    elif not isinstance(taxes_per_seller, list):
         raise ValueError("Parameter taxes_per_seller should be a list of TaxesPerSeller objects")
+
     if not all(isinstance(tax_per_seller, TaxesPerSeller) for tax_per_seller in taxes_per_seller):
         raise ValueError("Parameter taxes_per_seller should contain only TaxesPerSeller objects")
+    if required and len(taxes_per_seller) == 0:
+        raise ValueError("Parameter taxes_per_seller must contain at least one TaxesPerSeller object")
     return taxes_per_seller
 
 
@@ -74,12 +162,85 @@ def _validate_reference_invoice_lists(reference_invoice_number,
         reference_invoice_issued_date,
     ]
 
+    if reference_invoice_number is None:
+        if any(field is not None for field in reference_fields):
+            raise ValueError("Reference invoice fields must be provided together")
+        return
+
     if isinstance(reference_invoice_number, list):
+        if len(reference_invoice_number) == 0:
+            raise ValueError("Reference invoice lists must not be empty")
         if not all(isinstance(field, list) for field in reference_fields):
             raise ValueError("Reference invoice fields must all be lists when reference_invoice_number is a list")
         reference_count = len(reference_invoice_number)
         if not all(len(field) == reference_count for field in reference_fields):
             raise ValueError("Reference invoice field lists must have the same length")
+    elif any(field is None or isinstance(field, list) for field in reference_fields):
+        raise ValueError("Reference invoice fields must be scalar values provided together")
+
+
+def _validate_reference_sales_book_fields(reference_sales_book_number,
+                                          reference_sales_book_set_number,
+                                          reference_sales_book_serial_number,
+                                          reference_sales_book_issued_date):
+    fields = [reference_sales_book_set_number, reference_sales_book_serial_number, reference_sales_book_issued_date]
+    if reference_sales_book_number is None:
+        if any(field is not None for field in fields):
+            raise ValueError("Reference sales book fields must be provided together")
+        return
+    if any(field is None for field in fields):
+        raise ValueError("Reference sales book fields must be provided together")
+
+
+def _build_reference_invoice_list(reference_invoice_number,
+                                  reference_invoice_business_premise_id,
+                                  reference_invoice_electronic_device_id,
+                                  reference_invoice_issued_date):
+    _validate_reference_invoice_lists(reference_invoice_number,
+                                      reference_invoice_business_premise_id,
+                                      reference_invoice_electronic_device_id,
+                                      reference_invoice_issued_date)
+    if reference_invoice_number is None:
+        return []
+
+    if isinstance(reference_invoice_number, list):
+        return [{
+            'ReferenceInvoiceIdentifier': {
+                'BusinessPremiseID': _validate_identifier(reference_invoice_business_premise_id[i], 'reference_invoice_business_premise_id'),
+                'ElectronicDeviceID': _validate_identifier(reference_invoice_electronic_device_id[i], 'reference_invoice_electronic_device_id'),
+                'InvoiceNumber': _validate_invoice_number(reference_invoice_number[i], 'reference_invoice_number')
+            },
+            'ReferenceInvoiceIssueDateTime': _format_datetime(reference_invoice_issued_date[i])
+        } for i in range(0, len(reference_invoice_number))]
+
+    return [{
+        'ReferenceInvoiceIdentifier': {
+            'BusinessPremiseID': _validate_identifier(reference_invoice_business_premise_id, 'reference_invoice_business_premise_id'),
+            'ElectronicDeviceID': _validate_identifier(reference_invoice_electronic_device_id, 'reference_invoice_electronic_device_id'),
+            'InvoiceNumber': _validate_invoice_number(reference_invoice_number, 'reference_invoice_number')
+        },
+        'ReferenceInvoiceIssueDateTime': _format_datetime(reference_invoice_issued_date)
+    }]
+
+
+def _build_reference_sales_book_list(reference_sales_book_number,
+                                     reference_sales_book_set_number,
+                                     reference_sales_book_serial_number,
+                                     reference_sales_book_issued_date):
+    _validate_reference_sales_book_fields(reference_sales_book_number,
+                                          reference_sales_book_set_number,
+                                          reference_sales_book_serial_number,
+                                          reference_sales_book_issued_date)
+    if reference_sales_book_number is None:
+        return []
+    return [{
+        'ReferenceSalesBookIdentifier': {
+            'InvoiceNumber': _validate_invoice_number(reference_sales_book_number, 'reference_sales_book_number'),
+            'SetNumber': _validate_sales_book_set_number(reference_sales_book_set_number, 'reference_sales_book_set_number'),
+            'SerialNumber': _validate_sales_book_serial_number(reference_sales_book_serial_number, 'reference_sales_book_serial_number')
+        },
+        'ReferenceSalesBookIssueDate': _format_date(reference_sales_book_issued_date)
+    }]
 
 
 class FURSBusinessPremiseAPI(FURSBaseAPI):
@@ -103,60 +264,30 @@ class FURSBusinessPremiseAPI(FURSBaseAPI):
                                             foreign_software_supplier_name=None,
                                             special_notes='No notes',
                                             close=False):
-        """
-        Register immovable business premise to FURS.
-
-        :param tax_number: (int) Tax number of the business. E.g. "10039856"
-        :param premise_id: (string) Business Premise Identifier. E.g. "PE12"
-        :param real_estate_cadastral_number: (int) Cadastral number of the real estate. E.g. "365"
-        :param real_estate_building_number: (int) Cadastral building number. E.g. "12"
-        :param real_estate_building_section_number: (int) Cadastral building section number. E.g. "3"
-        :param street: (string) Street name of the premise. E.g. "Slovenska cesta"
-        :param house_number: (string) House number of the premise. E.g "24"
-        :param house_number_additional: (string) Additional house number. Empty string if does not exist. E.g. "B"
-        :param community: (sting) Name of the town. E.g "Ljubljana"
-        :param city: (string) Name of the post office. E.g. "Ljubljana"
-        :param postal_code: (string) Post office number. E.g. "1000"
-        :param validity_date: (datetime object) Datetime object representing the date when the premise started
-                                                issuing invoices
-        :param software_supplier_tax_number: (int) Tax number of the software supplier. E.g. "10039856"
-        :param foreign_software_supplier_name: (int) If software supplier is foreign company - does not have
-                                                     Slovenian Tax number, then please provide provider name.
-        :param special_notes: (string) If you need to send any special notes to FURS. Default is ""
-        :param close (boolean), If you want to close business unit. Default is False
-        :return: boolean: Will return True if success or raise an Exception if anything goes wrong
-
-        :raises
-            FURSException - FURS server returned an error
-            ConnectionTimedOutException - connection timed out
-            ConnectionException - Generic exception
-        """
         message = FURSBusinessPremiseAPI._build_common_message_body(**locals())
+        business_premise = message['BusinessPremiseRequest']['BusinessPremise']
+        bpi_identifier = business_premise['BPIdentifier']
 
-        bpi_identifier = message['BusinessPremiseRequest']['BusinessPremise']['BPIdentifier']
+        address = {
+            'Street': _validate_text(street, 'street', max_length=100),
+            'HouseNumber': _validate_text(house_number, 'house_number', max_length=10),
+            'Community': _validate_text(community, 'community', max_length=100),
+            'City': _validate_text(city, 'city', max_length=100),
+            'PostalCode': _validate_postal_code(postal_code)
+        }
+        if house_number_additional not in ('', None):
+            address['HouseNumberAdditional'] = _validate_text(house_number_additional, 'house_number_additional', max_length=10)
 
         bpi_identifier['RealEstateBP'] = {
-            'Address': {
-                'Street': street,
-                'HouseNumber': house_number,
-                'HouseNumberAdditional': house_number_additional,
-                'Community': community,
-                'City': city,
-                'PostalCode': postal_code
-            },
+            'Address': address,
             'PropertyID': {
-                'CadastralNumber': real_estate_cadastral_number,
-                'BuildingNumber': real_estate_building_number,
-                'BuildingSectionNumber': real_estate_building_section_number
+                'CadastralNumber': _normalize_decimal_number(real_estate_cadastral_number, 0, minimum='-1', maximum='10000', field_name='CadastralNumber'),
+                'BuildingNumber': _normalize_decimal_number(real_estate_building_number, 0, minimum='-1', maximum='100000', field_name='BuildingNumber'),
+                'BuildingSectionNumber': _normalize_decimal_number(real_estate_building_section_number, 0, minimum='-1', maximum='10000', field_name='BuildingSectionNumber')
             }
         }
 
-        if house_number_additional == '' or house_number_additional is None:
-            message['BusinessPremiseRequest']['BusinessPremise']\
-                ['BPIdentifier']['RealEstateBP']['Address'].pop('HouseNumberAdditional')
-
         self._send_request(path=REGISTER_BUSINESS_UNIT_PATH, data=message)
-
         return True
 
     def register_movable_business_premise(self,
@@ -168,72 +299,136 @@ class FURSBusinessPremiseAPI(FURSBaseAPI):
                                           foreign_software_supplier_name=None,
                                           special_notes='No notes',
                                           close=False):
+        message = FURSBusinessPremiseAPI._build_common_message_body(**locals())
+        bpi_identifier = message['BusinessPremiseRequest']['BusinessPremise']['BPIdentifier']
+
+        if movable_type not in (TYPE_MOVABLE_PREMISE_A, TYPE_MOVABLE_PREMISE_B, TYPE_MOVABLE_PREMISE_C):
+            raise ValueError("movable_type must be one of A, B or C")
+        bpi_identifier['PremiseType'] = movable_type
+
+        self._send_request(path=REGISTER_BUSINESS_UNIT_PATH, data=message)
+        return True
+
+    def register_vending_machine_business_premise(self,
+                                                  tax_number,
+                                                  premise_id,
+                                                  vending_machine_type,
+                                                  validity_date,
+                                                  software_supplier_tax_number=None,
+                                                  foreign_software_supplier_name=None,
+                                                  street=None,
+                                                  house_number=None,
+                                                  house_number_additional=None,
+                                                  community=None,
+                                                  city=None,
+                                                  postal_code=None,
+                                                  latitude=None,
+                                                  longitude=None,
+                                                  special_notes='No notes',
+                                                  close=False):
         """
-        Register movable business unit to FURS.
-
-        :param tax_number: (int) Tax number of the business. E.g. "10039856"
-        :param premise_id: (string) Business Premise Identifier. E.g. "PE12"
-        :param movable_type: (string) Type of the movable business unit. Values "A", "B" or "C"
-        :param validity_date: (datetime object) Datetime object representing the date when the premise started
-                                                issuing invoices
-        :param software_supplier_tax_number: (int) Tax number of the software supplier. E.g. "10039856"
-        :param foreign_software_supplier_name: (int) If software supplier is foreign company - does not have
-                                                     Slovenian Tax number, then please provide provider name.
-        :param special_notes: (string) If you need to send any special notes to FURS. Default is ""
-        :param close (boolean), If you want to close business unit. Default is False
-        :return: boolean: Will return True if success or raise an Exception if anything goes wrong
-
-        :raises
-            FURSException - FURS server returned an error
-            ConnectionTimedOutException - connection timed out
-            ConnectionException - Generic exception
+        Register a FURS v3.2 vending-machine business premise.
+        Provide either a full address or latitude/longitude geolocation.
         """
         message = FURSBusinessPremiseAPI._build_common_message_body(**locals())
         bpi_identifier = message['BusinessPremiseRequest']['BusinessPremise']['BPIdentifier']
 
-        bpi_identifier['PremiseType'] = movable_type
+        if vending_machine_type not in (TYPE_VENDING_MACHINE_D, TYPE_VENDING_MACHINE_E, TYPE_VENDING_MACHINE_F):
+            raise ValueError("vending_machine_type must be one of D, E or F")
 
+        vending_machine = {'VPremiseType': vending_machine_type}
+        has_address = all(value is not None for value in (street, house_number, community, city, postal_code))
+        has_geolocation = latitude is not None or longitude is not None
+
+        if has_address and has_geolocation:
+            raise ValueError("Provide either vending-machine address or geolocation, not both")
+        if has_address:
+            address = {
+                'Street': _validate_text(street, 'street', max_length=100),
+                'HouseNumber': _validate_text(house_number, 'house_number', max_length=10),
+                'Community': _validate_text(community, 'community', max_length=100),
+                'City': _validate_text(city, 'city', max_length=100),
+                'PostalCode': _validate_postal_code(postal_code)
+            }
+            if house_number_additional not in ('', None):
+                address['HouseNumberAdditional'] = _validate_text(house_number_additional, 'house_number_additional', max_length=10)
+            vending_machine['Address'] = address
+        elif latitude is not None and longitude is not None:
+            vending_machine['Geolocation'] = {
+                'Latitude': _normalize_geolocation(latitude, Decimal('99.999999'), 'Latitude'),
+                'Longitude': _normalize_geolocation(longitude, Decimal('999.999999'), 'Longitude')
+            }
+        else:
+            raise ValueError("Vending-machine registration requires either full address or latitude and longitude")
+
+        bpi_identifier['VendingMachine'] = vending_machine
         self._send_request(path=REGISTER_BUSINESS_UNIT_PATH, data=message)
+        return True
 
+    def register_business_premises_batch(self, business_premise_messages):
+        """
+        Submit already-built BusinessPremise payload dictionaries through the FURS batch endpoint.
+        """
+        if not isinstance(business_premise_messages, list) or len(business_premise_messages) < 2:
+            raise ValueError("business_premise_messages must contain at least two items for batch submission")
+        if len(business_premise_messages) > 500:
+            raise ValueError("business_premise_messages must contain at most 500 items")
+        record_infos = []
+        for index, message in enumerate(business_premise_messages, start=1):
+            if 'BusinessPremiseRequest' in message:
+                business_premise = message['BusinessPremiseRequest']['BusinessPremise']
+            elif 'BusinessPremise' in message:
+                business_premise = message['BusinessPremise']
+            else:
+                business_premise = message
+            record_infos.append({'RecordNumber': index, 'BusinessPremise': business_premise})
+        batch_message = {
+            'BusinessPremiseListRequest': {
+                'Header': FURSBusinessPremiseAPI._prepare_business_premise_request_header(),
+                'BusinessPremiseList': {'RecordInfo': record_infos}
+            }
+        }
+        self._send_request(path=REGISTER_BUSINESS_UNIT_BATCH_PATH, data=batch_message)
         return True
 
     @staticmethod
     def _prepare_business_premise_request_header():
-        header = {
+        return {
             "MessageID": str(uuid.uuid4()),
             "DateTime": _format_datetime(datetime.datetime.now())
         }
 
-        return header
-
     @staticmethod
     def _prepare_software_supplier_json(software_supplier_tax_number=None, foreign_software_supplier_name=None):
         if software_supplier_tax_number:
-            return {'TaxNumber': software_supplier_tax_number}
-        else:
-            return {'NameForeign': foreign_software_supplier_name}
+            return {'TaxNumber': _validate_tax_number(software_supplier_tax_number, 'software_supplier_tax_number')}
+        if foreign_software_supplier_name:
+            return {'NameForeign': _validate_text(foreign_software_supplier_name, 'foreign_software_supplier_name', max_length=1000)}
+        raise ValueError("Either software_supplier_tax_number or foreign_software_supplier_name must be provided")
 
     @staticmethod
     def _build_common_message_body(*args, **kwargs):
-        data = dict()
-        data['BusinessPremiseRequest'] = {
-            'Header': FURSBusinessPremiseAPI._prepare_business_premise_request_header(),
-            'BusinessPremise': {
-                'TaxNumber': kwargs['tax_number'],
-                'BusinessPremiseID': kwargs['premise_id'],
-                'ValidityDate': _format_date(kwargs['validity_date']),
-                'SpecialNotes': kwargs['special_notes'],
-                'SoftwareSupplier': [
-                    FURSBusinessPremiseAPI._prepare_software_supplier_json(kwargs['software_supplier_tax_number'],
-                                                                           kwargs['foreign_software_supplier_name'])
-                ],
-                'BPIdentifier': {}
+        business_premise = {
+            'TaxNumber': _validate_tax_number(kwargs['tax_number']),
+            'BusinessPremiseID': _validate_identifier(kwargs['premise_id'], 'premise_id'),
+            'ValidityDate': _format_date(kwargs['validity_date']),
+            'SoftwareSupplier': [
+                FURSBusinessPremiseAPI._prepare_software_supplier_json(kwargs['software_supplier_tax_number'],
+                                                                       kwargs['foreign_software_supplier_name'])
+            ],
+            'BPIdentifier': {}
+        }
+        special_notes = kwargs.get('special_notes')
+        if special_notes:
+            business_premise['SpecialNotes'] = _validate_text(special_notes, 'special_notes', max_length=1000)
+        if kwargs.get('close', False):
+            business_premise['ClosingTag'] = 'Z'
+        return {
+            'BusinessPremiseRequest': {
+                'Header': FURSBusinessPremiseAPI._prepare_business_premise_request_header(),
+                'BusinessPremise': business_premise
             }
         }
-        if kwargs.get('close', False):
-            data['BusinessPremiseRequest']['BusinessPremise']['ClosingTag'] = 'Z'
-
-        return data
 
 
 class TaxesPerSeller:
@@ -250,52 +445,49 @@ class TaxesPerSeller:
         self.non_taxable_amount = non_taxable_amount
         self.special_tax_rules_amount = special_tax_rules_amount
         self.seller_tax_number = seller_tax_number
-
         self.vat_amounts = []
+        self.flat_rate_compensations = []
 
     def add_vat_amount(self, tax_rate, tax_base, tax_amount):
-        vat_amount = {
-            'TaxRate': _normalize_decimal_number(tax_rate),
-            'TaxableAmount': _normalize_decimal_number(tax_base),
-            'TaxAmount': _normalize_decimal_number(tax_amount)
-        }
+        self.vat_amounts.append({
+            'TaxRate': _normalize_tax_rate(tax_rate),
+            'TaxableAmount': _normalize_amount(tax_base),
+            'TaxAmount': _normalize_amount(tax_amount)
+        })
 
-        self.vat_amounts.append(vat_amount)
+    def add_flat_rate_compensation(self, flat_rate_rate, flat_rate_taxable_amount, flat_rate_amount):
+        self.flat_rate_compensations.append({
+            'FlatRateRate': _normalize_tax_rate(flat_rate_rate),
+            'FlatRateTaxableAmount': _normalize_amount(flat_rate_taxable_amount),
+            'FlatRateAmount': _normalize_amount(flat_rate_amount)
+        })
 
     def build_json(self):
-        tax_spec = {
-            'VAT': self.vat_amounts,
-        }
-
-        if len(self.vat_amounts) == 0:
-            tax_spec.pop('VAT')
-
-        if self.non_taxable_amount is not None:
-            tax_spec['NontaxableAmount'] = _normalize_decimal_number(self.non_taxable_amount)
-        if self.reverse_vat_taxable_amount is not None:
-            tax_spec['ReverseVATTaxableAmount'] = _normalize_decimal_number(self.reverse_vat_taxable_amount)
-        if self.exempt_vat_taxable_amount is not None:
-            tax_spec['ExemptVATTaxableAmount'] = _normalize_decimal_number(self.exempt_vat_taxable_amount)
-        if self.other_taxes_amount is not None:
-            tax_spec['OtherTaxesAmount'] = _normalize_decimal_number(self.other_taxes_amount)
-        if self.special_tax_rules_amount is not None:
-            tax_spec['SpecialTaxRulesAmount'] = _normalize_decimal_number(self.special_tax_rules_amount)
-
+        tax_spec = {}
         if self.seller_tax_number:
-            tax_spec['SellerTaxNumber'] = self.seller_tax_number
-
+            tax_spec['SellerTaxNumber'] = _validate_tax_number(self.seller_tax_number, 'seller_tax_number')
+        if len(self.vat_amounts) > 0:
+            tax_spec['VAT'] = self.vat_amounts
+        if len(self.flat_rate_compensations) > 0:
+            tax_spec['FlatRateCompensation'] = self.flat_rate_compensations
+        if self.non_taxable_amount is not None:
+            tax_spec['NontaxableAmount'] = _normalize_amount(self.non_taxable_amount)
+        if self.reverse_vat_taxable_amount is not None:
+            tax_spec['ReverseVATTaxableAmount'] = _normalize_amount(self.reverse_vat_taxable_amount)
+        if self.exempt_vat_taxable_amount is not None:
+            tax_spec['ExemptVATTaxableAmount'] = _normalize_amount(self.exempt_vat_taxable_amount)
+        if self.other_taxes_amount is not None:
+            tax_spec['OtherTaxesAmount'] = _normalize_amount(self.other_taxes_amount)
+        if self.special_tax_rules_amount is not None:
+            tax_spec['SpecialTaxRulesAmount'] = _normalize_amount(self.special_tax_rules_amount)
+        if not tax_spec:
+            raise ValueError("TaxesPerSeller must contain at least one tax amount field")
         return tax_spec
 
 
 class FURSInvoiceAPI(FURSBaseAPI):
 
     def __init__(self, *args, **kwargs):
-        """
-        Initialize the class with current active tax rates in Slovenia.
-        :param args:
-        :param kwargs:
-        :return:
-        """
         FURSBaseAPI.__init__(self, *args, **kwargs)
 
     def calculate_zoi(self,
@@ -304,44 +496,33 @@ class FURSInvoiceAPI(FURSBaseAPI):
                       invoice_number,
                       business_premise_id,
                       electronic_device_id,
-                      invoice_amount):
+                      invoice_amount,
+                      date_format='%d.%m.%Y %H:%M:%S'):
         """
         Calculate ZOI - Protective Mark of the Invoice Issuer.
-
-        :param tax_number: (int) issuer tax number
-        :param issued_date: (datetime) datetime of the invoice issue
-        :param invoice_number: (string) invoice sequential number
-        :param business_premise_id: (string) business premise id
-        :param electronic_device_id: (string) electronic device id
-        :param invoice_amount: (Decimal) invoice amount
-        :return: (string) ZOI string
+        Defaults to the date format used by the FURS v3.2 implementation examples.
         """
-        content = "%s%s%s%s%s%s" % (tax_number,
-                                    issued_date.strftime('%d-%m-%Y %H:%M:%S'),
-                                    invoice_number, business_premise_id, electronic_device_id, invoice_amount)
-
+        content = "%s%s%s%s%s%s" % (_validate_tax_number(tax_number),
+                                    issued_date.strftime(date_format),
+                                    _validate_invoice_number(invoice_number),
+                                    _validate_identifier(business_premise_id, 'business_premise_id'),
+                                    _validate_identifier(electronic_device_id, 'electronic_device_id'),
+                                    Decimal(str(invoice_amount)).quantize(Decimal('0.01')))
         return hashlib.md5(self._sign(content=content)).hexdigest()
 
     def prepare_printable(self, tax_number, zoi, issued_date, timezone='Europe/Ljubljana'):
-        """
-        Get Data Record for QR Code/Code 128/PDF417 that should be placed at the bottom of the Invoice.
-
-        :param tax_number:
-        :param zoi:
-        :param issued_date:
-        :return: (string) Data Record
-        """
+        if not _ZOI_RE.match(zoi):
+            raise ValueError("zoi must be a 32-character hexadecimal string")
+        tax_number = _validate_tax_number(tax_number)
         if issued_date.tzinfo:
             tz = pytz.timezone(timezone)
             issued_date = issued_date.astimezone(tz)
 
         zoi_base10 = str(int(zoi, 16)).zfill(39)
         date_str = issued_date.strftime('%y%m%d%H%M%S')
-
-        data = zoi_base10+str(tax_number)+date_str
+        data = zoi_base10 + str(tax_number) + date_str
         control = str(sum(map(int, data)) % 10)
-
-        return data+control
+        return data + control
 
     def get_invoice_eor(self,
                         zoi,
@@ -362,125 +543,86 @@ class FURSInvoiceAPI(FURSBaseAPI):
                         reference_invoice_business_premise_id=None,
                         reference_invoice_electronic_device_id=None,
                         reference_invoice_issued_date=None,
+                        reference_sales_book_number=None,
+                        reference_sales_book_set_number=None,
+                        reference_sales_book_serial_number=None,
+                        reference_sales_book_issued_date=None,
                         numbering_structure=NUMBERING_STRUCTURE_DEVICE,
                         special_notes=''):
-        """
-        Obtain EOR from FURS. Will build the request and call the FURS API.
-
-        :param zoi:
-        :param tax_number:
-        :param issued_date:
-        :param invoice_number:
-        :param business_premise_id:
-        :param electronic_device_id:
-        :param invoice_amount:
-        :param taxes_per_seller: (list) - List of TaxesPerSeller objects
-        :param payment_amount:
-        :param customer_vat_number:
-        :param returns_amount:
-        :param operator_tax_number: (int) - Tax number of the register operator
-        :param foreign_operator: (boolean) - Set to True if register operator does not have Slovenian TAX number
-        :param subsequent_submit: (boolean) - Set to True if you're reissuing the request to FURS
-        :param reference_invoice_number: (string) - Required if we're issuing Storno
-        :param reference_invoice_business_premise_id: (string) - Required if we're issuing Storno
-        :param reference_invoice_electronic_device_id: (string) - Required if we're issuing Storno
-        :param reference_invoice_issued_date: (datetime) - Required if we're issuing Storno
-        :param numbering_structure: (string) - defaults to B - numbering is defined by the Register, C for central numbering
-        :param special_notes:
-        :return: eor (string) - Invoice UniqueID from FURS
-        """
         if operator_tax_number is not None and foreign_operator:
             raise ValueError("operator_tax_number and foreign_operator=True are mutually exclusive")
 
         taxes_per_seller = _ensure_taxes_per_seller_list(taxes_per_seller)
-        _validate_reference_invoice_lists(reference_invoice_number,
-                                          reference_invoice_business_premise_id,
-                                          reference_invoice_electronic_device_id,
-                                          reference_invoice_issued_date)
-
-        # build the base message body
         message = self._build_common_message_body(**locals())
+        invoice = message['InvoiceRequest']['Invoice']
 
-        # add tax specification
         for tax_per_seller in taxes_per_seller:
-            message['InvoiceRequest']['Invoice']['TaxesPerSeller'].append(tax_per_seller.build_json())
+            invoice['TaxesPerSeller'].append(tax_per_seller.build_json())
 
         if customer_vat_number:
-            message['InvoiceRequest']['Invoice']['CustomerVATNumber'] = customer_vat_number
-
+            invoice['CustomerVATNumber'] = _validate_text(customer_vat_number, 'customer_vat_number', max_length=20)
         if returns_amount is not None:
-            message['InvoiceRequest']['Invoice']['ReturnsAmount'] = _normalize_decimal_number(returns_amount)
-
+            invoice['ReturnsAmount'] = _normalize_amount(returns_amount)
         if operator_tax_number is not None:
-            message['InvoiceRequest']['Invoice']['OperatorTaxNumber'] = operator_tax_number
-
+            invoice['OperatorTaxNumber'] = _validate_tax_number(operator_tax_number, 'operator_tax_number')
         if foreign_operator:
-            message['InvoiceRequest']['Invoice']['ForeignOperator'] = True
-
+            invoice['ForeignOperator'] = True
         if subsequent_submit:
-            message['InvoiceRequest']['Invoice']['SubsequentSubmit'] = True
+            invoice['SubsequentSubmit'] = True
 
-        if reference_invoice_number:
-            reference_invoices = []
-            if isinstance(reference_invoice_number, list):
-                for i in range(0, len(reference_invoice_number)):
-                    reference_invoices.append({
-                        'ReferenceInvoiceIdentifier': {
-                            'BusinessPremiseID': reference_invoice_business_premise_id[i],
-                            'ElectronicDeviceID': reference_invoice_electronic_device_id[i],
-                            'InvoiceNumber': reference_invoice_number[i]
-                        },
-                        'ReferenceInvoiceIssueDateTime': _format_datetime(reference_invoice_issued_date[i])
-                    })
-            else:
-                reference_invoices.append({
-                    'ReferenceInvoiceIdentifier': {
-                        'BusinessPremiseID': reference_invoice_business_premise_id,
-                        'ElectronicDeviceID': reference_invoice_electronic_device_id,
-                        'InvoiceNumber': reference_invoice_number
-                    },
-                    'ReferenceInvoiceIssueDateTime': _format_datetime(reference_invoice_issued_date)
-                })
+        reference_invoices = _build_reference_invoice_list(reference_invoice_number,
+                                                           reference_invoice_business_premise_id,
+                                                           reference_invoice_electronic_device_id,
+                                                           reference_invoice_issued_date)
+        if reference_invoices:
+            invoice['ReferenceInvoice'] = reference_invoices
 
-            message['InvoiceRequest']['Invoice']['ReferenceInvoice'] = reference_invoices
-            message['InvoiceRequest']['Invoice']['SpecialNotes'] = special_notes
+        reference_sales_books = _build_reference_sales_book_list(reference_sales_book_number,
+                                                                 reference_sales_book_set_number,
+                                                                 reference_sales_book_serial_number,
+                                                                 reference_sales_book_issued_date)
+        if reference_sales_books:
+            invoice['ReferenceSalesBook'] = reference_sales_books
+
+        if special_notes:
+            invoice['SpecialNotes'] = _validate_text(special_notes, 'special_notes', min_length=0, max_length=1000)
 
         response = self._send_request(path=INVOICE_ISSUE_PATH, data=message)
-
         return response['InvoiceResponse']['UniqueInvoiceID']
 
     @staticmethod
     def _prepare_invoice_request_header():
-        header = {
+        return {
             "MessageID": str(uuid.uuid4()),
             "DateTime": _format_datetime(datetime.datetime.now())
         }
 
-        return header
-
     @staticmethod
     def _build_common_message_body(*args, **kwargs):
-        data = dict()
-        data['InvoiceRequest'] = {
-            'Header': FURSInvoiceAPI._prepare_invoice_request_header(),
-            'Invoice': {
-                'TaxNumber': kwargs['tax_number'],
-                'IssueDateTime': _format_datetime(kwargs['issued_date']),
-                'NumberingStructure': kwargs['numbering_structure'],
-                'InvoiceIdentifier': {
-                    'BusinessPremiseID': kwargs['business_premise_id'],
-                    'ElectronicDeviceID': kwargs['electronic_device_id'],
-                    'InvoiceNumber': kwargs['invoice_number']
-                },
-                'InvoiceAmount': _normalize_decimal_number(kwargs['invoice_amount']),
-                'PaymentAmount': _normalize_decimal_number(kwargs['payment_amount']) if kwargs['payment_amount'] is not None else _normalize_decimal_number(kwargs['invoice_amount']),
-                'ProtectedID': kwargs['zoi'],
-                'TaxesPerSeller': [],
+        numbering_structure = kwargs['numbering_structure']
+        if numbering_structure not in (NUMBERING_STRUCTURE_DEVICE, NUMBERING_STRUCTURE_CENTRAL):
+            raise ValueError("numbering_structure must be B or C")
+        if not _ZOI_RE.match(kwargs['zoi']):
+            raise ValueError("zoi must be a 32-character hexadecimal string")
+        return {
+            'InvoiceRequest': {
+                'Header': FURSInvoiceAPI._prepare_invoice_request_header(),
+                'Invoice': {
+                    'TaxNumber': _validate_tax_number(kwargs['tax_number']),
+                    'IssueDateTime': _format_datetime(kwargs['issued_date']),
+                    'NumberingStructure': numbering_structure,
+                    'InvoiceIdentifier': {
+                        'BusinessPremiseID': _validate_identifier(kwargs['business_premise_id'], 'business_premise_id'),
+                        'ElectronicDeviceID': _validate_identifier(kwargs['electronic_device_id'], 'electronic_device_id'),
+                        'InvoiceNumber': _validate_invoice_number(kwargs['invoice_number'])
+                    },
+                    'InvoiceAmount': _normalize_amount(kwargs['invoice_amount']),
+                    'PaymentAmount': _normalize_amount(kwargs['payment_amount']) if kwargs['payment_amount'] is not None else _normalize_amount(kwargs['invoice_amount']),
+                    'ProtectedID': kwargs['zoi'],
+                    'TaxesPerSeller': [],
+                }
             }
         }
-
-        return data
-
 
     def get_sales_book_invoice_eor(self,
                                    tax_number,
@@ -504,89 +646,89 @@ class FURSInvoiceAPI(FURSBaseAPI):
                                    reference_sales_book_serial_number=None,
                                    reference_sales_book_issued_date=None,
                                    special_notes=''):
-        """
-        Obtain EOR from FURS. Will build the request and call the FURS API.
-
-        :param tax_number:
-        :param issued_date:
-        :param invoice_number:
-        :param business_premise_id:
-        :param set_number:
-        :param serial_number:
-        :param invoice_amount:
-        :param taxes_per_seller: (list) - List of TaxesPerSeller objects
-        :param payment_amount:
-        :param customer_vat_number:
-        :param returns_amount:
-        :param operator_tax_number: (int) - Tax number of the register operator
-        :param reference_invoice_number: (string) - Required if we're issuing Storno
-        :param reference_invoice_business_premise_id: (string) - Required if we're issuing Storno
-        :param reference_invoice_electronic_device_id: (string) - Required if we're issuing Storno
-        :param reference_invoice_issued_date: (datetime) - Required if we're issuing Storno
-        :param special_notes:
-        :return: eor (string) - Invoice UniqueID from FURS
-        """
         taxes_per_seller = _ensure_taxes_per_seller_list(taxes_per_seller)
-
-        # build the base message body
         message = self._build_common_sales_book_message_body(**locals())
+        sales_book_invoice = message['InvoiceRequest']['SalesBookInvoice']
 
-        # add tax specification
         for tax_per_seller in taxes_per_seller:
-            message['InvoiceRequest']['SalesBookInvoice']['TaxesPerSeller'].append(tax_per_seller.build_json())
+            sales_book_invoice['TaxesPerSeller'].append(tax_per_seller.build_json())
 
         if customer_vat_number:
-            message['InvoiceRequest']['SalesBookInvoice']['CustomerVATNumber'] = customer_vat_number
-
+            sales_book_invoice['CustomerVATNumber'] = _validate_text(customer_vat_number, 'customer_vat_number', max_length=20)
         if returns_amount is not None:
-            message['InvoiceRequest']['SalesBookInvoice']['ReturnsAmount'] = _normalize_decimal_number(returns_amount)
+            sales_book_invoice['ReturnsAmount'] = _normalize_amount(returns_amount)
+        if operator_tax_number is not None:
+            # The official schema for SalesBookInvoice does not include OperatorTaxNumber.
+            raise ValueError("operator_tax_number is not supported for SalesBookInvoice payloads by the official JSON schema")
 
-        if reference_invoice_number:
-            reference_invoice = [{
-                'ReferenceInvoiceIdentifier': {
-                    'BusinessPremiseID': reference_invoice_business_premise_id,
-                    'ElectronicDeviceID': reference_invoice_electronic_device_id,
-                    'InvoiceNumber': reference_invoice_number
-                },
-                'ReferenceInvoiceIssueDateTime': _format_datetime(reference_invoice_issued_date)
-            }]
-            message['InvoiceRequest']['SalesBookInvoice']['ReferenceInvoice'] = reference_invoice
+        reference_invoices = _build_reference_invoice_list(reference_invoice_number,
+                                                           reference_invoice_business_premise_id,
+                                                           reference_invoice_electronic_device_id,
+                                                           reference_invoice_issued_date)
+        if reference_invoices:
+            sales_book_invoice['ReferenceInvoice'] = reference_invoices
 
-        if reference_sales_book_number:
-            reference_sales_book = [{
-                'ReferenceSalesBookIdentifier': {
-                    'InvoiceNumber': reference_sales_book_number,
-                    'SetNumber': reference_sales_book_set_number,
-                    'SerialNumber': reference_sales_book_serial_number
-                },
-                'ReferenceSalesBookIssueDate': _format_date(reference_sales_book_issued_date)
-            }]
-            message['InvoiceRequest']['SalesBookInvoice']['ReferenceSalesBook'] = reference_sales_book
-            message['InvoiceRequest']['SalesBookInvoice']['SpecialNotes'] = special_notes
+        reference_sales_books = _build_reference_sales_book_list(reference_sales_book_number,
+                                                                 reference_sales_book_set_number,
+                                                                 reference_sales_book_serial_number,
+                                                                 reference_sales_book_issued_date)
+        if reference_sales_books:
+            sales_book_invoice['ReferenceSalesBook'] = reference_sales_books
+
+        if special_notes:
+            sales_book_invoice['SpecialNotes'] = _validate_text(special_notes, 'special_notes', min_length=0, max_length=1000)
 
         response = self._send_request(path=INVOICE_ISSUE_PATH, data=message)
-
         return response['InvoiceResponse']['UniqueInvoiceID']
-
 
     @staticmethod
     def _build_common_sales_book_message_body(*args, **kwargs):
-        data = dict()
-        data['InvoiceRequest'] = {
-            'Header': FURSInvoiceAPI._prepare_invoice_request_header(),
-            'SalesBookInvoice': {
-                'TaxNumber': kwargs['tax_number'],
-                'IssueDate': _format_date(kwargs['issued_date']),
-                'SalesBookIdentifier': {
-                    'InvoiceNumber': kwargs['invoice_number'],
-                    'SetNumber': kwargs['set_number'],
-                    'SerialNumber': kwargs['serial_number'],
-                },
-                'BusinessPremiseID': kwargs['business_premise_id'],
-                'InvoiceAmount': _normalize_decimal_number(kwargs['invoice_amount']),
-                'PaymentAmount': _normalize_decimal_number(kwargs['payment_amount']) if kwargs['payment_amount'] is not None else _normalize_decimal_number(kwargs['invoice_amount']),
-                'TaxesPerSeller': [],
+        return {
+            'InvoiceRequest': {
+                'Header': FURSInvoiceAPI._prepare_invoice_request_header(),
+                'SalesBookInvoice': {
+                    'TaxNumber': _validate_tax_number(kwargs['tax_number']),
+                    'IssueDate': _format_date(kwargs['issued_date']),
+                    'SalesBookIdentifier': {
+                        'InvoiceNumber': _validate_invoice_number(kwargs['invoice_number']),
+                        'SetNumber': _validate_sales_book_set_number(kwargs['set_number']),
+                        'SerialNumber': _validate_sales_book_serial_number(kwargs['serial_number']),
+                    },
+                    'BusinessPremiseID': _validate_identifier(kwargs['business_premise_id'], 'business_premise_id'),
+                    'InvoiceAmount': _normalize_amount(kwargs['invoice_amount']),
+                    'PaymentAmount': _normalize_amount(kwargs['payment_amount']) if kwargs['payment_amount'] is not None else _normalize_amount(kwargs['invoice_amount']),
+                    'TaxesPerSeller': [],
+                }
             }
         }
 
-        return data
+    def submit_invoice_batch(self, invoice_messages):
+        """
+        Submit already-built Invoice or SalesBookInvoice payload dictionaries through the FURS batch endpoint.
+        """
+        if not isinstance(invoice_messages, list) or len(invoice_messages) < 2:
+            raise ValueError("invoice_messages must contain at least two items for batch submission")
+        if len(invoice_messages) > 500:
+            raise ValueError("invoice_messages must contain at most 500 items")
+        record_infos = []
+        for index, message in enumerate(invoice_messages, start=1):
+            if 'InvoiceRequest' in message:
+                invoice_request = message['InvoiceRequest']
+                if 'Invoice' in invoice_request:
+                    record_infos.append({'RecordNumber': index, 'Invoice': invoice_request['Invoice']})
+                if 'SalesBookInvoice' in invoice_request:
+                    record_infos.append({'RecordNumber': index, 'Invoice': invoice_request['SalesBookInvoice']})
+            elif 'Invoice' in message:
+                record_infos.append({'RecordNumber': index, 'Invoice': message['Invoice']})
+            elif 'SalesBookInvoice' in message:
+                record_infos.append({'RecordNumber': index, 'Invoice': message['SalesBookInvoice']})
+            else:
+                raise ValueError("Each invoice batch item must contain InvoiceRequest, Invoice or SalesBookInvoice")
+        batch_message = {
+            'InvoiceListRequest': {
+                'Header': FURSInvoiceAPI._prepare_invoice_request_header(),
+                'InvoiceList': {'RecordInfo': record_infos}
+            }
+        }
+        response = self._send_request(path=INVOICE_ISSUE_BATCH_PATH, data=batch_message)
+        return response
