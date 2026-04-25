@@ -1,4 +1,5 @@
 import tempfile
+import os
 import requests
 import jwt
 
@@ -75,12 +76,42 @@ class Connector(object):
         self.cert_temp = tempfile.NamedTemporaryFile(delete=False)
         self.cert_temp.write(crypto.dump_certificate(crypto.FILETYPE_PEM, X509.from_cryptography(self.p12.cert.certificate)))
         self.cert_temp.flush()
+        self.cert_temp.close()
 
         self.pkey_temp = tempfile.NamedTemporaryFile(delete=False)
+        os.chmod(self.pkey_temp.name, 0o600)
         self.pkey_temp.write(self.p12.key.private_bytes(encoding=serialization.Encoding.PEM,
                                                         format=serialization.PrivateFormat.TraditionalOpenSSL,
                                                         encryption_algorithm=serialization.NoEncryption()))
         self.pkey_temp.flush()
+        self.pkey_temp.close()
+
+    def close(self):
+        """
+        Remove temporary certificate and private key files created for requests.
+
+        :return: None
+        """
+        for temp_file_attr in ('cert_temp', 'pkey_temp'):
+            temp_file = getattr(self, temp_file_attr, None)
+            if temp_file is None:
+                continue
+            try:
+                if not temp_file.closed:
+                    temp_file.close()
+            finally:
+                try:
+                    os.unlink(temp_file.name)
+                except FileNotFoundError:
+                    pass
+                setattr(self, temp_file_attr, None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
 
     def _get_jws_header(self):
         """

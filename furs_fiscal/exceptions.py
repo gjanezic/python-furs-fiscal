@@ -27,7 +27,7 @@ class ConnectionException(Exception):
     Connection Exception will be thrown if the server responds with anything else than status code 200
     """
     def __init__(self, code, message):
-        self.code = code,
+        self.code = code
         self.message = message
 
         super(ConnectionException, self).__init__(message)

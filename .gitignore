@@ -23,6 +23,10 @@ venv/
 *.egg-info/
 .installed.cfg
 *.egg
+.kilocode/
+AGENTS.md
+plans/
+specs/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -59,3 +63,7 @@ target/
 
 # PyCharm
 *.idea/
+
+# Private certificates and key stores
+*.p12
+*.pfx

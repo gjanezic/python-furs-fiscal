@@ -1,10 +1,9 @@
-import json
 import jwt
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from requests.exceptions import Timeout
+from requests.exceptions import RequestException, Timeout
 from requests import codes
 
 from furs_fiscal.connector import Connector
@@ -31,6 +30,8 @@ class FURSBaseAPI(object):
             return self.connector.send_echo().status_code == codes.ok
         except Timeout as e:
             return False
+        except RequestException:
+            return False
 
     def _send_request(self, path, data):
         """
@@ -50,7 +51,12 @@ class FURSBaseAPI(object):
 
             if response.status_code == codes.ok:
                 # TODO - we should verify server signature!
-                server_response = jwt.decode(response.json()['token'], options={"verify_signature": False})
+                try:
+                    token = response.json()['token']
+                    server_response = jwt.decode(token, options={"verify_signature": False})
+                except (ValueError, KeyError, jwt.PyJWTError) as e:
+                    raise ConnectionException(code='INVALID_RESPONSE',
+                                              message='FURS response did not contain a valid token') from e
                 return self._check_for_errors(server_response)
             else:
                 raise ConnectionException(code=response.status_code,
@@ -58,6 +64,8 @@ class FURSBaseAPI(object):
 
         except Timeout as e:
             raise ConnectionTimedOutException(e)
+        except RequestException as e:
+            raise ConnectionException(code='REQUEST_FAILED', message=str(e)) from e
 
     def _check_for_errors(self, server_response):
         """
@@ -76,8 +84,5 @@ class FURSBaseAPI(object):
 
     def _sign(self, content, algorithm=hashes.SHA256()):
         return self.connector.p12.key.sign(data=bytes(content, 'utf-8'),
-                                           padding=padding.PSS(
-                                                mgf=padding.MGF1(hashes.SHA256()),
-                                                salt_length=padding.PSS.MAX_LENGTH
-                                            ),
+                                           padding=padding.PKCS1v15(),
                                            algorithm=algorithm)

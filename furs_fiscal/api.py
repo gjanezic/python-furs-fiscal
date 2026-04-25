@@ -2,6 +2,7 @@ import pytz
 import hashlib
 import uuid
 import datetime
+from decimal import Decimal, InvalidOperation
 
 from furs_fiscal.base_api import FURSBaseAPI
 
@@ -15,6 +16,70 @@ NUMBERING_STRUCTURE_DEVICE = 'B'
 
 REGISTER_BUSINESS_UNIT_PATH = 'v1/cash_registers/invoices/register'
 INVOICE_ISSUE_PATH = 'v1/cash_registers/invoices'
+
+
+def _format_datetime(value):
+    return value.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _format_date(value):
+    return value.strftime("%Y-%m-%d")
+
+
+def _normalize_decimal_number(value, max_decimals=2):
+    if value is None:
+        return None
+
+    try:
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("Decimal number fields must be valid numeric values") from exc
+
+    if not decimal_value.is_finite():
+        raise ValueError("Decimal number fields must be finite numeric values")
+
+    quant = Decimal(1).scaleb(-max_decimals)
+    try:
+        quantized = decimal_value.quantize(quant)
+    except InvalidOperation as exc:
+        raise ValueError("Decimal number fields must be valid numeric values") from exc
+
+    if decimal_value != quantized:
+        raise ValueError("Decimal number fields support at most %s decimal places" % max_decimals)
+
+    if quantized == quantized.to_integral_value():
+        return int(quantized)
+    return float(quantized)
+
+
+def _ensure_taxes_per_seller_list(taxes_per_seller):
+    if taxes_per_seller is None:
+        return []
+    if isinstance(taxes_per_seller, TaxesPerSeller):
+        return [taxes_per_seller]
+    if not isinstance(taxes_per_seller, list):
+        raise ValueError("Parameter taxes_per_seller should be a list of TaxesPerSeller objects")
+    if not all(isinstance(tax_per_seller, TaxesPerSeller) for tax_per_seller in taxes_per_seller):
+        raise ValueError("Parameter taxes_per_seller should contain only TaxesPerSeller objects")
+    return taxes_per_seller
+
+
+def _validate_reference_invoice_lists(reference_invoice_number,
+                                      reference_invoice_business_premise_id,
+                                      reference_invoice_electronic_device_id,
+                                      reference_invoice_issued_date):
+    reference_fields = [
+        reference_invoice_business_premise_id,
+        reference_invoice_electronic_device_id,
+        reference_invoice_issued_date,
+    ]
+
+    if isinstance(reference_invoice_number, list):
+        if not all(isinstance(field, list) for field in reference_fields):
+            raise ValueError("Reference invoice fields must all be lists when reference_invoice_number is a list")
+        reference_count = len(reference_invoice_number)
+        if not all(len(field) == reference_count for field in reference_fields):
+            raise ValueError("Reference invoice field lists must have the same length")
 
 
 class FURSBusinessPremiseAPI(FURSBaseAPI):
@@ -136,7 +201,7 @@ class FURSBusinessPremiseAPI(FURSBaseAPI):
     def _prepare_business_premise_request_header():
         header = {
             "MessageID": str(uuid.uuid4()),
-            "DateTime": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            "DateTime": _format_datetime(datetime.datetime.now())
         }
 
         return header
@@ -156,7 +221,7 @@ class FURSBusinessPremiseAPI(FURSBaseAPI):
             'BusinessPremise': {
                 'TaxNumber': kwargs['tax_number'],
                 'BusinessPremiseID': kwargs['premise_id'],
-                'ValidityDate': kwargs['validity_date'].strftime("%Y-%m-%d"),
+                'ValidityDate': _format_date(kwargs['validity_date']),
                 'SpecialNotes': kwargs['special_notes'],
                 'SoftwareSupplier': [
                     FURSBusinessPremiseAPI._prepare_software_supplier_json(kwargs['software_supplier_tax_number'],
@@ -190,9 +255,9 @@ class TaxesPerSeller:
 
     def add_vat_amount(self, tax_rate, tax_base, tax_amount):
         vat_amount = {
-            'TaxRate': tax_rate,
-            'TaxableAmount': tax_base,
-            'TaxAmount': tax_amount
+            'TaxRate': _normalize_decimal_number(tax_rate),
+            'TaxableAmount': _normalize_decimal_number(tax_base),
+            'TaxAmount': _normalize_decimal_number(tax_amount)
         }
 
         self.vat_amounts.append(vat_amount)
@@ -205,14 +270,16 @@ class TaxesPerSeller:
         if len(self.vat_amounts) == 0:
             tax_spec.pop('VAT')
 
-        if self.non_taxable_amount:
-            tax_spec['NontaxableAmount'] = self.non_taxable_amount
-        if self.reverse_vat_taxable_amount:
-            tax_spec['ReverseVATTaxableAmount'] = self.reverse_vat_taxable_amount
-        if self.exempt_vat_taxable_amount:
-            tax_spec['ExemptVATTaxableAmount'] = self.exempt_vat_taxable_amount
-        if self.other_taxes_amount:
-            tax_spec['OtherTaxesAmount'] = self.other_taxes_amount
+        if self.non_taxable_amount is not None:
+            tax_spec['NontaxableAmount'] = _normalize_decimal_number(self.non_taxable_amount)
+        if self.reverse_vat_taxable_amount is not None:
+            tax_spec['ReverseVATTaxableAmount'] = _normalize_decimal_number(self.reverse_vat_taxable_amount)
+        if self.exempt_vat_taxable_amount is not None:
+            tax_spec['ExemptVATTaxableAmount'] = _normalize_decimal_number(self.exempt_vat_taxable_amount)
+        if self.other_taxes_amount is not None:
+            tax_spec['OtherTaxesAmount'] = _normalize_decimal_number(self.other_taxes_amount)
+        if self.special_tax_rules_amount is not None:
+            tax_spec['SpecialTaxRulesAmount'] = _normalize_decimal_number(self.special_tax_rules_amount)
 
         if self.seller_tax_number:
             tax_spec['SellerTaxNumber'] = self.seller_tax_number
@@ -284,7 +351,7 @@ class FURSInvoiceAPI(FURSBaseAPI):
                         business_premise_id,
                         electronic_device_id,
                         invoice_amount,
-                        taxes_per_seller=[],
+                        taxes_per_seller=None,
                         payment_amount=None,
                         customer_vat_number=None,
                         returns_amount=None,
@@ -322,14 +389,17 @@ class FURSInvoiceAPI(FURSBaseAPI):
         :param special_notes:
         :return: eor (string) - Invoice UniqueID from FURS
         """
+        if operator_tax_number is not None and foreign_operator:
+            raise ValueError("operator_tax_number and foreign_operator=True are mutually exclusive")
+
+        taxes_per_seller = _ensure_taxes_per_seller_list(taxes_per_seller)
+        _validate_reference_invoice_lists(reference_invoice_number,
+                                          reference_invoice_business_premise_id,
+                                          reference_invoice_electronic_device_id,
+                                          reference_invoice_issued_date)
+
         # build the base message body
         message = self._build_common_message_body(**locals())
-
-        # Validate taxes_per_seller!
-        if type(taxes_per_seller) == TaxesPerSeller:
-            taxes_per_seller = [taxes_per_seller]
-        elif type(taxes_per_seller) != list:
-            raise Exception("Parameter taxes_per_seller should be a list of TaxesPerSeller objects")
 
         # add tax specification
         for tax_per_seller in taxes_per_seller:
@@ -338,10 +408,10 @@ class FURSInvoiceAPI(FURSBaseAPI):
         if customer_vat_number:
             message['InvoiceRequest']['Invoice']['CustomerVATNumber'] = customer_vat_number
 
-        if returns_amount:
-            message['InvoiceRequest']['Invoice']['ReturnsAmount'] = returns_amount
+        if returns_amount is not None:
+            message['InvoiceRequest']['Invoice']['ReturnsAmount'] = _normalize_decimal_number(returns_amount)
 
-        if operator_tax_number:
+        if operator_tax_number is not None:
             message['InvoiceRequest']['Invoice']['OperatorTaxNumber'] = operator_tax_number
 
         if foreign_operator:
@@ -360,7 +430,7 @@ class FURSInvoiceAPI(FURSBaseAPI):
                             'ElectronicDeviceID': reference_invoice_electronic_device_id[i],
                             'InvoiceNumber': reference_invoice_number[i]
                         },
-                        'ReferenceInvoiceIssueDateTime': reference_invoice_issued_date[i].strftime("%Y-%m-%dT%H:%M:%SZ")
+                        'ReferenceInvoiceIssueDateTime': _format_datetime(reference_invoice_issued_date[i])
                     })
             else:
                 reference_invoices.append({
@@ -369,7 +439,7 @@ class FURSInvoiceAPI(FURSBaseAPI):
                         'ElectronicDeviceID': reference_invoice_electronic_device_id,
                         'InvoiceNumber': reference_invoice_number
                     },
-                    'ReferenceInvoiceIssueDateTime': reference_invoice_issued_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    'ReferenceInvoiceIssueDateTime': _format_datetime(reference_invoice_issued_date)
                 })
 
             message['InvoiceRequest']['Invoice']['ReferenceInvoice'] = reference_invoices
@@ -383,7 +453,7 @@ class FURSInvoiceAPI(FURSBaseAPI):
     def _prepare_invoice_request_header():
         header = {
             "MessageID": str(uuid.uuid4()),
-            "DateTime": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            "DateTime": _format_datetime(datetime.datetime.now())
         }
 
         return header
@@ -395,15 +465,15 @@ class FURSInvoiceAPI(FURSBaseAPI):
             'Header': FURSInvoiceAPI._prepare_invoice_request_header(),
             'Invoice': {
                 'TaxNumber': kwargs['tax_number'],
-                'IssueDateTime': kwargs['issued_date'].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                'IssueDateTime': _format_datetime(kwargs['issued_date']),
                 'NumberingStructure': kwargs['numbering_structure'],
                 'InvoiceIdentifier': {
                     'BusinessPremiseID': kwargs['business_premise_id'],
                     'ElectronicDeviceID': kwargs['electronic_device_id'],
                     'InvoiceNumber': kwargs['invoice_number']
                 },
-                'InvoiceAmount': kwargs['invoice_amount'],
-                'PaymentAmount': kwargs['payment_amount'] if kwargs['payment_amount'] else kwargs['invoice_amount'],
+                'InvoiceAmount': _normalize_decimal_number(kwargs['invoice_amount']),
+                'PaymentAmount': _normalize_decimal_number(kwargs['payment_amount']) if kwargs['payment_amount'] is not None else _normalize_decimal_number(kwargs['invoice_amount']),
                 'ProtectedID': kwargs['zoi'],
                 'TaxesPerSeller': [],
             }
@@ -420,7 +490,7 @@ class FURSInvoiceAPI(FURSBaseAPI):
                                    set_number,
                                    serial_number,
                                    invoice_amount,
-                                   taxes_per_seller=[],
+                                   taxes_per_seller=None,
                                    payment_amount=None,
                                    customer_vat_number=None,
                                    returns_amount=None,
@@ -456,14 +526,10 @@ class FURSInvoiceAPI(FURSBaseAPI):
         :param special_notes:
         :return: eor (string) - Invoice UniqueID from FURS
         """
+        taxes_per_seller = _ensure_taxes_per_seller_list(taxes_per_seller)
+
         # build the base message body
         message = self._build_common_sales_book_message_body(**locals())
-
-        # Validate taxes_per_seller!
-        if type(taxes_per_seller) == TaxesPerSeller:
-            taxes_per_seller = [taxes_per_seller]
-        elif type(taxes_per_seller) != list:
-            raise Exception("Parameter taxes_per_seller should be a list of TaxesPerSeller objects")
 
         # add tax specification
         for tax_per_seller in taxes_per_seller:
@@ -472,8 +538,8 @@ class FURSInvoiceAPI(FURSBaseAPI):
         if customer_vat_number:
             message['InvoiceRequest']['SalesBookInvoice']['CustomerVATNumber'] = customer_vat_number
 
-        if returns_amount:
-            message['InvoiceRequest']['SalesBookInvoice']['ReturnsAmount'] = returns_amount
+        if returns_amount is not None:
+            message['InvoiceRequest']['SalesBookInvoice']['ReturnsAmount'] = _normalize_decimal_number(returns_amount)
 
         if reference_invoice_number:
             reference_invoice = [{
@@ -482,7 +548,7 @@ class FURSInvoiceAPI(FURSBaseAPI):
                     'ElectronicDeviceID': reference_invoice_electronic_device_id,
                     'InvoiceNumber': reference_invoice_number
                 },
-                'ReferenceInvoiceIssueDateTime': reference_invoice_issued_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+                'ReferenceInvoiceIssueDateTime': _format_datetime(reference_invoice_issued_date)
             }]
             message['InvoiceRequest']['SalesBookInvoice']['ReferenceInvoice'] = reference_invoice
 
@@ -493,7 +559,7 @@ class FURSInvoiceAPI(FURSBaseAPI):
                     'SetNumber': reference_sales_book_set_number,
                     'SerialNumber': reference_sales_book_serial_number
                 },
-                'ReferenceSalesBookIssueDate': reference_sales_book_issued_date.isoformat()
+                'ReferenceSalesBookIssueDate': _format_date(reference_sales_book_issued_date)
             }]
             message['InvoiceRequest']['SalesBookInvoice']['ReferenceSalesBook'] = reference_sales_book
             message['InvoiceRequest']['SalesBookInvoice']['SpecialNotes'] = special_notes
@@ -510,15 +576,15 @@ class FURSInvoiceAPI(FURSBaseAPI):
             'Header': FURSInvoiceAPI._prepare_invoice_request_header(),
             'SalesBookInvoice': {
                 'TaxNumber': kwargs['tax_number'],
-                'IssueDate': kwargs['issued_date'].strftime("%Y-%m-%d"),
+                'IssueDate': _format_date(kwargs['issued_date']),
                 'SalesBookIdentifier': {
                     'InvoiceNumber': kwargs['invoice_number'],
                     'SetNumber': kwargs['set_number'],
                     'SerialNumber': kwargs['serial_number'],
                 },
                 'BusinessPremiseID': kwargs['business_premise_id'],
-                'InvoiceAmount': kwargs['invoice_amount'],
-                'PaymentAmount': kwargs['payment_amount'] if kwargs['payment_amount'] else kwargs['invoice_amount'],
+                'InvoiceAmount': _normalize_decimal_number(kwargs['invoice_amount']),
+                'PaymentAmount': _normalize_decimal_number(kwargs['payment_amount']) if kwargs['payment_amount'] is not None else _normalize_decimal_number(kwargs['invoice_amount']),
                 'TaxesPerSeller': [],
             }
         }
