@@ -1,5 +1,6 @@
 import os
 import tempfile
+import warnings
 
 import requests
 import jwt
@@ -12,6 +13,16 @@ from cryptography.hazmat.primitives.serialization.pkcs12 import load_pkcs12
 
 FURS_TEST_ENDPOINT = 'https://blagajne-test.fu.gov.si:9002'
 FURS_PRODUCTION_ENDPOINT = 'https://blagajne.fu.gov.si:9003'
+
+
+class FURSTLSVerificationDisabledWarning(UserWarning):
+    """Emitted when the connector is constructed with TLS verification disabled.
+
+    The FURS technical specification mandates two-way TLS with verification of
+    the server certificate against the SIGOV-CA chain. Disabling verification
+    leaves the channel vulnerable to MITM attacks. Pass a CA bundle path or
+    ``verify_tls=True`` to silence this warning.
+    """
 
 # TODO - we should add all the certificates to trusted CA's to make this work.
 # TODO - for now we'll just keep it to verify=False...
@@ -42,9 +53,14 @@ class Connector(object):
         :param production: (boolean) Should we use FURS Production server of Test server
         :param request_timeout: (float) How long should we wait for the request to timeout
         :param proxy: (dict) Specify proxy details if you need one, for example: {"http": "http://localhost:3128", "https": "http://localhost:3128"}
-        :param verify_tls: False for legacy behaviour, True for system CA verification,
-                           or a CA bundle path for FURS/SIGOV-CA pinning.
-        :param disable_tls_warnings: Disable urllib3 warnings when verify_tls=False.
+        :param verify_tls: ``False`` (legacy default) or any other falsy value
+                           except ``None`` disables verification. ``True`` uses
+                           the system CA bundle. A string path pins to a CA
+                           bundle (e.g. SIGOV-CA). ``None`` falls back to
+                           ``requests`` defaults (REQUESTS_CA_BUNDLE env var or
+                           system CAs — i.e. verification is enabled).
+        :param disable_tls_warnings: Disable urllib3 warnings when verification
+                                     is disabled.
         :return: None
         """
         self.p12_path = p12_path
@@ -60,8 +76,19 @@ class Connector(object):
 
         self.proxy = proxy
         self.verify_tls = verify_tls
-        if disable_tls_warnings and verify_tls is False:
-            requests.packages.urllib3.disable_warnings()
+        # Any falsy value other than None disables verification in `requests`
+        # (False, 0, ''). None means "use REQUESTS_CA_BUNDLE/system CAs", which
+        # is fine. Catch the dangerous-but-falsy variants too, not just False.
+        if not verify_tls and verify_tls is not None:
+            warnings.warn(
+                "FURS connector created with TLS verification disabled. The FURS spec "
+                "requires verifying the server certificate against the SIGOV-CA chain. "
+                "Pass verify_tls=True or a CA bundle path to enable verification.",
+                FURSTLSVerificationDisabledWarning,
+                stacklevel=2,
+            )
+            if disable_tls_warnings:
+                requests.packages.urllib3.disable_warnings()
 
         # self.furs_cert = open(self.cert, 'rt').read()
         # load certificate...
@@ -75,7 +102,8 @@ class Connector(object):
         :return: None
         """
         if self.p12_buffer is None:
-            self.p12_buffer = open(self.p12_path, 'rb').read()
+            with open(self.p12_path, 'rb') as p12_file:
+                self.p12_buffer = p12_file.read()
         self.p12 = load_pkcs12(self.p12_buffer, password=bytes(p12_password, 'utf-8'))
         self._store_temp_files()
 
@@ -83,6 +111,9 @@ class Connector(object):
         """
         Requests library requires string path to PKey and Cert - therefore we save those into
         temporary files on the file system.
+
+        ``tempfile.NamedTemporaryFile`` already creates files with mode 0o600 on
+        POSIX (via ``mkstemp``), so no explicit ``chmod`` is needed.
 
         :return: None
         """
@@ -92,7 +123,6 @@ class Connector(object):
         self.cert_temp.close()
 
         self.pkey_temp = tempfile.NamedTemporaryFile(delete=False)
-        os.chmod(self.pkey_temp.name, 0o600)
         self.pkey_temp.write(self.p12.key.private_bytes(encoding=serialization.Encoding.PEM,
                                                         format=serialization.PrivateFormat.TraditionalOpenSSL,
                                                         encryption_algorithm=serialization.NoEncryption()))

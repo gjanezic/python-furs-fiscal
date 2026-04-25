@@ -47,14 +47,16 @@ def build_p12_buffer(password=P12_CERT_PASSWORD):
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'test-institutions'),
         x509.NameAttribute(NameOID.COMMON_NAME, 'TEST CERTIFICATE'),
     ])
+    # Use a relative validity window so the test cert never expires under us.
+    now = datetime.now(tz=timezone.utc)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(issuer)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime(2026, 1, 1, tzinfo=timezone.utc))
-        .not_valid_after(datetime(2027, 1, 1, tzinfo=timezone.utc))
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=365))
         .sign(key, hashes.SHA256())
     )
     return serialize_key_and_certificates(
@@ -312,6 +314,23 @@ def test_connection_exception_code_is_not_tuple():
     assert exc.code == 500
 
 
+def test_pkey_temp_file_is_not_world_or_group_readable():
+    """The private-key file must not leak to other users on the box. POSIX
+    ``mkstemp`` (used internally by NamedTemporaryFile) creates files with
+    mode 0o600, but a future refactor that switches to plain ``open`` would
+    silently regress that. Fail loudly if anything other than the owner can
+    read or write the key file. POSIX-only by design — Windows uses ACLs."""
+    if os.name != 'posix':
+        pytest.skip('POSIX-only file mode check')
+    connector = build_test_certificate_connector()
+    try:
+        mode = os.stat(connector.pkey_temp.name).st_mode
+        # Group + other bits should be zero.
+        assert mode & 0o077 == 0, oct(mode)
+    finally:
+        connector.close()
+
+
 def test_connector_close_removes_temp_files():
     connector = object.__new__(Connector)
     cert_temp = tempfile.NamedTemporaryFile(delete=False)
@@ -350,3 +369,233 @@ def test_invoice_rejects_missing_taxes_per_seller():
             electronic_device_id='B1',
             invoice_amount=Decimal('66.70'),
         )
+
+
+def test_calculate_zoi_rejects_amount_with_more_than_two_decimals():
+    """ZOI must be derived from the same numeric value sent in InvoiceAmount.
+    Silently rounding 66.715 to 66.72 would produce a ZOI that does not match
+    the value FURS receives, breaking server-side verification."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    api = object.__new__(FURSInvoiceAPI)
+    api.connector = DummyConnector(key)
+    issued_date = datetime(2026, 4, 25, 8, 0, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match='at most 2 decimal places'):
+        api.calculate_zoi(10039856, issued_date, '11', 'BP105', 'B1', Decimal('66.715'))
+
+
+def test_submit_invoice_batch_rejects_sales_book_invoice_payloads():
+    """The official FiscalVerificationSchemaBatch.json only defines InvoiceType
+    for batch records; SalesBookInvoiceType is not allowed. Earlier code wrapped
+    SalesBookInvoice as Invoice, producing payloads that FURS rejects with
+    'Additional properties are not allowed (BusinessPremiseID, IssueDate, ...)'."""
+    api = object.__new__(FURSInvoiceAPI)
+    api._send_request = lambda path, data: None  # would not be reached
+
+    sales_book_payload = {
+        'InvoiceRequest': {
+            'Header': {'MessageID': 'irrelevant', 'DateTime': '2026-04-25T08:00:00'},
+            'SalesBookInvoice': {'TaxNumber': 10039856},
+        }
+    }
+    invoice_payload = {
+        'InvoiceRequest': {
+            'Header': {'MessageID': 'irrelevant', 'DateTime': '2026-04-25T08:00:00'},
+            'Invoice': {'TaxNumber': 10039856},
+        }
+    }
+
+    with pytest.raises(ValueError, match='SalesBookInvoice payloads cannot be submitted'):
+        api.submit_invoice_batch([invoice_payload, sales_book_payload])
+
+    # Bare top-level SalesBookInvoice key path is also rejected.
+    bare_sales_book = {'SalesBookInvoice': {'TaxNumber': 10039856}}
+    with pytest.raises(ValueError, match='SalesBookInvoice payloads cannot be submitted'):
+        api.submit_invoice_batch([invoice_payload, bare_sales_book])
+
+
+def test_submit_invoice_batch_forwards_valid_invoice_payloads():
+    """Counterpart to the rejection test: two valid Invoice payloads should
+    reach _send_request wrapped in the official InvoiceListRequest envelope
+    with sequential RecordNumber values starting at 1."""
+    api = object.__new__(FURSInvoiceAPI)
+    captured = {}
+
+    def fake_send_request(path, data):
+        captured['path'] = path
+        captured['data'] = data
+        return {'InvoiceListResponse': {}}
+
+    api._send_request = fake_send_request
+
+    invoice_one = {
+        'InvoiceRequest': {
+            'Header': {'MessageID': 'irrelevant', 'DateTime': '2026-04-25T08:00:00'},
+            'Invoice': {'TaxNumber': 10039856, 'InvoiceAmount': 1.00},
+        }
+    }
+    # Mix InvoiceRequest-wrapped and bare-Invoice forms to exercise both branches.
+    invoice_two = {'Invoice': {'TaxNumber': 10039856, 'InvoiceAmount': 2.00}}
+
+    response = api.submit_invoice_batch([invoice_one, invoice_two])
+
+    assert response == {'InvoiceListResponse': {}}
+    record_infos = captured['data']['InvoiceListRequest']['InvoiceList']['RecordInfo']
+    assert [r['RecordNumber'] for r in record_infos] == [1, 2]
+    assert record_infos[0]['Invoice'] == invoice_one['InvoiceRequest']['Invoice']
+    assert record_infos[1]['Invoice'] == invoice_two['Invoice']
+    assert 'Header' in captured['data']['InvoiceListRequest']
+
+
+def test_verify_furs_response_true_without_key_is_rejected_at_construction():
+    """verify_furs_response=True is the MITM-resistant mode and only makes
+    sense with a pinned public key. Constructing without one used to silently
+    fall through to x5c-based verification — that mode is now opt-in via the
+    'x5c-untrusted' string instead."""
+    from furs_fiscal.base_api import FURSBaseAPI
+
+    with pytest.raises(ValueError, match='requires furs_response_public_key'):
+        FURSBaseAPI(
+            p12_path=None,
+            p12_password=P12_CERT_PASSWORD,
+            p12_buffer=build_p12_buffer(),
+            production=False,
+            verify_furs_response=True,
+        )
+
+
+def test_decode_furs_token_rejects_expired_x5c_certificate():
+    """In x5c-untrusted mode the certificate is extracted from the response
+    itself, so anything an attacker can substitute is fair game — but at
+    minimum we must refuse a cert that is outside its validity window."""
+    import base64 as _base64
+
+    from cryptography.hazmat.primitives.serialization import Encoding
+    from furs_fiscal.base_api import FURSBaseAPI
+    from furs_fiscal.exceptions import ConnectionException
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, 'SI'),
+        x509.NameAttribute(NameOID.COMMON_NAME, 'EXPIRED-FURS-RESPONSE-TEST'),
+    ])
+    expired_before = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    expired_after = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(expired_before)
+        .not_valid_after(expired_after)
+        .sign(key, hashes.SHA256())
+    )
+    x5c_value = _base64.b64encode(cert.public_bytes(Encoding.DER)).decode('ascii')
+    token = jwt.encode(
+        {'InvoiceResponse': {'UniqueInvoiceID': 'EOR-X'}},
+        key=key,
+        algorithm='RS256',
+        headers={'x5c': [x5c_value]},
+    )
+
+    api = object.__new__(FURSBaseAPI)
+    api.verify_furs_response = 'x5c-untrusted'
+    api.furs_response_public_key = None
+
+    with pytest.raises(ConnectionException, match='validity window'):
+        api._decode_furs_token(token)
+
+
+def test_sales_book_reference_rejects_list_inputs_with_clear_message():
+    """Sales-book references only allow scalar values per spec R_4.13–R_4.16.
+    Earlier code accepted lists silently and only failed deep inside the regex
+    validator with an opaque 'invalid format' error."""
+    api = build_invoice_api()
+    tax = TaxesPerSeller(non_taxable_amount=Decimal('0.00'))
+
+    with pytest.raises(ValueError, match='must be scalar values'):
+        api.get_sales_book_invoice_eor(
+            tax_number=10039856,
+            issued_date=datetime(2026, 4, 25, 8, 0, 0, tzinfo=timezone.utc),
+            invoice_number='612',
+            business_premise_id='BP105',
+            set_number='03',
+            serial_number='5001-0001018',
+            invoice_amount=Decimal('66.70'),
+            taxes_per_seller=tax,
+            reference_sales_book_number=['611', '610'],
+            reference_sales_book_set_number='03',
+            reference_sales_book_serial_number='5001-0001017',
+            reference_sales_book_issued_date=datetime(2026, 4, 24, 8, 0, 0, tzinfo=timezone.utc),
+        )
+
+
+def test_connector_emits_warning_when_tls_verification_disabled():
+    """The FURS spec requires verifying the SIGOV-CA chain. Disabling
+    verification (the legacy default) must surface a warning so callers do
+    not silently ship MITM-vulnerable clients."""
+    import warnings as _warnings
+
+    from furs_fiscal.connector import FURSTLSVerificationDisabledWarning
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter('always')
+        connector = build_test_certificate_connector()
+        try:
+            assert any(
+                issubclass(w.category, FURSTLSVerificationDisabledWarning)
+                for w in caught
+            ), 'expected FURSTLSVerificationDisabledWarning'
+        finally:
+            connector.close()
+
+
+def test_decode_furs_token_extracts_signing_certificate_from_x5c_header():
+    """When verify_furs_response='x5c-untrusted', the signing certificate
+    must be extracted from the JWS x5c header per spec sec. 8.1. A
+    FURSResponseChainNotVerifiedWarning is emitted because the chain is
+    not validated against a pinned trust anchor."""
+    import base64 as _base64
+    import warnings as _warnings
+
+    from cryptography.hazmat.primitives.serialization import Encoding
+    from furs_fiscal.base_api import FURSBaseAPI, FURSResponseChainNotVerifiedWarning
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, 'SI'),
+        x509.NameAttribute(NameOID.COMMON_NAME, 'FURS-RESPONSE-TEST'),
+    ])
+    now = datetime.now(tz=timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=365))
+        .sign(key, hashes.SHA256())
+    )
+    x5c_value = _base64.b64encode(cert.public_bytes(Encoding.DER)).decode('ascii')
+    token = jwt.encode(
+        {'InvoiceResponse': {'UniqueInvoiceID': 'EOR-X'}},
+        key=key,
+        algorithm='RS256',
+        headers={'x5c': [x5c_value]},
+    )
+
+    api = object.__new__(FURSBaseAPI)
+    api.verify_furs_response = 'x5c-untrusted'
+    api.furs_response_public_key = None
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter('always')
+        decoded = api._decode_furs_token(token)
+
+    assert decoded == {'InvoiceResponse': {'UniqueInvoiceID': 'EOR-X'}}
+    assert any(
+        issubclass(w.category, FURSResponseChainNotVerifiedWarning)
+        for w in caught
+    ), 'expected FURSResponseChainNotVerifiedWarning when verifying via x5c'

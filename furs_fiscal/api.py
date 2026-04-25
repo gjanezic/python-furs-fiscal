@@ -35,6 +35,9 @@ def _format_datetime(value):
 
 
 def _format_date(value):
+    # FURS spec text (R_3.0.x, R_4.15, BusinessPremise ValidityDate) uses "YYYY-MM-DD".
+    # The official JSON Schema annotates these fields as `format: date-time`, but the
+    # signed JSON examples in specs/examples/ confirm date-only strings are accepted.
     return value.strftime("%Y-%m-%d")
 
 
@@ -183,12 +186,17 @@ def _validate_reference_sales_book_fields(reference_sales_book_number,
                                           reference_sales_book_set_number,
                                           reference_sales_book_serial_number,
                                           reference_sales_book_issued_date):
-    fields = [reference_sales_book_set_number, reference_sales_book_serial_number, reference_sales_book_issued_date]
-    if reference_sales_book_number is None:
-        if any(field is not None for field in fields):
-            raise ValueError("Reference sales book fields must be provided together")
+    secondary_fields = [
+        reference_sales_book_set_number,
+        reference_sales_book_serial_number,
+        reference_sales_book_issued_date,
+    ]
+    if reference_sales_book_number is None and all(field is None for field in secondary_fields):
         return
-    if any(field is None for field in fields):
+    all_fields = [reference_sales_book_number] + secondary_fields
+    if any(isinstance(field, list) for field in all_fields):
+        raise ValueError("Reference sales book fields must be scalar values; lists are not supported")
+    if reference_sales_book_number is None or any(field is None for field in secondary_fields):
         raise ValueError("Reference sales book fields must be provided together")
 
 
@@ -501,7 +509,16 @@ class FURSInvoiceAPI(FURSBaseAPI):
         """
         Calculate ZOI - Protective Mark of the Invoice Issuer.
         Defaults to the date format used by the FURS v3.2 implementation examples.
+
+        ``invoice_amount`` is validated through the same rules as the invoice
+        payload (max 2 decimal places); this prevents silent rounding that
+        would make the ZOI inconsistent with the InvoiceAmount sent to FURS.
         """
+        # Validate-only: _normalize_amount raises ValueError if invoice_amount
+        # has too many decimals or is otherwise unacceptable. The validated
+        # value isn't reused — quantize() below is just a defensive 0.01
+        # zero-pad ('66.7' -> '66.70') for the hashed string.
+        _normalize_amount(invoice_amount)
         content = "%s%s%s%s%s%s" % (_validate_tax_number(tax_number),
                                     issued_date.strftime(date_format),
                                     _validate_invoice_number(invoice_number),
@@ -704,7 +721,20 @@ class FURSInvoiceAPI(FURSBaseAPI):
 
     def submit_invoice_batch(self, invoice_messages):
         """
-        Submit already-built Invoice or SalesBookInvoice payload dictionaries through the FURS batch endpoint.
+        Submit already-built Invoice payload dictionaries through the FURS batch endpoint.
+
+        The batch endpoint only accepts electronic-device invoices; SalesBookInvoice
+        payloads are rejected by the official ``FiscalVerificationSchemaBatch.json``
+        (RecordInfoType.items.Invoice references InvoiceType only). Use the
+        single-message :meth:`get_sales_book_invoice_eor` for sales-book invoices.
+
+        The full FURS response dict is returned. **Callers must inspect each
+        record's reply** — per-record EORs and per-record ``Error`` blocks are
+        nested under ``InvoiceListResponse.InvoiceListReply.RecordReply``.
+        ``submit_invoice_batch`` only raises automatically for a batch-wide
+        ``Error`` returned by :meth:`_check_for_errors`; a batch where some
+        records succeed and others fail will return normally, and silently
+        ignoring per-record errors will leave failed records un-fiscalised.
         """
         if not isinstance(invoice_messages, list) or len(invoice_messages) < 2:
             raise ValueError("invoice_messages must contain at least two items for batch submission")
@@ -714,16 +744,27 @@ class FURSInvoiceAPI(FURSBaseAPI):
         for index, message in enumerate(invoice_messages, start=1):
             if 'InvoiceRequest' in message:
                 invoice_request = message['InvoiceRequest']
-                if 'Invoice' in invoice_request:
-                    record_infos.append({'RecordNumber': index, 'Invoice': invoice_request['Invoice']})
                 if 'SalesBookInvoice' in invoice_request:
-                    record_infos.append({'RecordNumber': index, 'Invoice': invoice_request['SalesBookInvoice']})
+                    raise ValueError(
+                        "SalesBookInvoice payloads cannot be submitted via the FURS batch endpoint "
+                        "(item %d). Use get_sales_book_invoice_eor() instead." % index
+                    )
+                if 'Invoice' not in invoice_request:
+                    raise ValueError(
+                        "Item %d has InvoiceRequest without an Invoice payload" % index
+                    )
+                record_infos.append({'RecordNumber': index, 'Invoice': invoice_request['Invoice']})
+            elif 'SalesBookInvoice' in message:
+                raise ValueError(
+                    "SalesBookInvoice payloads cannot be submitted via the FURS batch endpoint "
+                    "(item %d). Use get_sales_book_invoice_eor() instead." % index
+                )
             elif 'Invoice' in message:
                 record_infos.append({'RecordNumber': index, 'Invoice': message['Invoice']})
-            elif 'SalesBookInvoice' in message:
-                record_infos.append({'RecordNumber': index, 'Invoice': message['SalesBookInvoice']})
             else:
-                raise ValueError("Each invoice batch item must contain InvoiceRequest, Invoice or SalesBookInvoice")
+                raise ValueError(
+                    "Each invoice batch item must contain InvoiceRequest or Invoice (item %d)" % index
+                )
         batch_message = {
             'InvoiceListRequest': {
                 'Header': FURSInvoiceAPI._prepare_invoice_request_header(),
