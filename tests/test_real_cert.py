@@ -659,3 +659,92 @@ def test_live_register_business_premise_against_furs_test_endpoint(real_p12_data
         decoded = client.submit_business_premise(bp)
     assert "BusinessPremiseResponse" in decoded
     assert "Error" not in decoded["BusinessPremiseResponse"]
+
+
+# ---------------------------------------------------------------------------
+# 8. Expiry surveillance — yellow CI before FURS rotates a cert
+# ---------------------------------------------------------------------------
+#
+# When a FURS-published cert is within CERT_EXPIRY_WARNING_DAYS of its
+# notAfter, the relevant test below emits a UserWarning instead of failing.
+# pytest surfaces these in its end-of-run "warnings summary", which most
+# CI dashboards render as yellow. Once the cert actually expires the test
+# fails red — by then refreshing the material is no longer optional.
+#
+# Workflow when one of these turns yellow::
+#
+#     make refresh-test-certs                    # for *TEST_*.cer / TEST_TLS_BUNDLE
+#     make refresh-prod-certs PROD_YEAR=<YYYY>   # for *PROD_*.cer / PROD_TLS_BUNDLE
+#
+# then commit the updated files in ``specs/{test,prod}_certs/`` and
+# update ``test_furs_published_cert_loads_and_has_expected_cn`` if FURS
+# changed any CN in the rotation.
+
+CERT_EXPIRY_WARNING_DAYS = 30
+
+
+def _cert_not_valid_after_utc(cert: x509.Certificate) -> datetime:
+    # Mirror the safe pattern used in furs_fiscal/transport.py so this
+    # works on both cryptography <42 and >=42.
+    return getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after.replace(
+        tzinfo=timezone.utc
+    )
+
+
+def _check_expiry(label: str, expires: datetime, refresh_hint: str) -> None:
+    days_left = (expires - datetime.now(tz=timezone.utc)).days
+    assert days_left > 0, (
+        f"{label} EXPIRED {-days_left} days ago "
+        f"(notAfter={expires.isoformat()}). {refresh_hint}"
+    )
+    if days_left < CERT_EXPIRY_WARNING_DAYS:
+        warnings.warn(
+            f"{label} expires in {days_left} days "
+            f"(notAfter={expires.isoformat()}) — {refresh_hint}",
+            UserWarning,
+            stacklevel=2,
+        )
+
+
+@pytest.mark.parametrize(
+    "path,refresh_target",
+    [
+        (TEST_DAVPOTRAC_CER, "make refresh-test-certs"),
+        (TEST_BLAGAJNE_CER, "make refresh-test-certs"),
+        (TEST_SIGOV_CA, "make refresh-test-certs"),
+        (TEST_SI_TRUST_ROOT, "make refresh-test-certs"),
+        (PROD_DAVPOTRAC_CER, "make refresh-prod-certs PROD_YEAR=<YYYY>"),
+        (PROD_BLAGAJNE_CER, "make refresh-prod-certs PROD_YEAR=<YYYY>"),
+        (PROD_SIGOV_CA, "make refresh-prod-certs PROD_YEAR=<YYYY>"),
+        (PROD_SI_TRUST_ROOT, "make refresh-prod-certs PROD_YEAR=<YYYY>"),
+    ],
+)
+def test_furs_published_cert_expiry(path: Path, refresh_target: str):
+    """Surveillance: emit a warning if a FURS-published cert expires
+    within ``CERT_EXPIRY_WARNING_DAYS`` days; fail outright if it has
+    already expired. Skipped if the cert file is not checked out."""
+    cert = _load_furs_cer(path)
+    _check_expiry(
+        label=path.name,
+        expires=_cert_not_valid_after_utc(cert),
+        refresh_hint=f"refresh via `{refresh_target}`",
+    )
+
+
+def test_real_p12_client_cert_expiry(real_p12_data):
+    """Surveillance for the FURS test-environment client p12. Unlike the
+    public certs, this one cannot be re-fetched with curl — it is FURS-
+    issued material for *TESTNO PODJETJE 1211*. When this turns yellow,
+    download the new p12 from the eDavki technical-specifications page
+    and update REAL_P12_PASSWORD / the serial assertion in
+    ``test_jws_header_uses_real_cert_metadata`` if either changed."""
+    _, _, cert = _load_ssl_context_with_client_cert(
+        p12_data=real_p12_data,
+        p12_password=REAL_P12_PASSWORD,
+        verify_tls=True,
+    )
+    _check_expiry(
+        label="10492682-2.p12 (TESTNO PODJETJE 1211)",
+        expires=_cert_not_valid_after_utc(cert),
+        refresh_hint="re-issue via FURS eDavki and replace specs/test_certs/10492682-2.p12",
+    )
